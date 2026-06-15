@@ -3,7 +3,6 @@
 #include <atomic>
 #include "stream_app.hpp"
 
-// メインスレッド終了用の安全装置
 std::atomic<bool> keep_running(true);
 void signal_handler(int) {
     keep_running = false;
@@ -14,10 +13,14 @@ int main() {
     std::cout << "--- 映像伝送 Server (受信側) 起動 ---" << std::endl;
 
     try {
-        // ① アプリケーション全体を生成（ポート番号、タイトル、幅、高さを指定）
-        StreamApp app(1234, "EV Camera Stream", 320, 240);
+        // ★ここでモードを指定！
+        // DecodeMode::Software_CPU : CPU4コア全開の超低遅延モード
+        // DecodeMode::Hardware_Pi4 : GPU専用チップのエコモード
+        DecodeMode mode = DecodeMode::Hardware_Pi4;
 
-        // ② アプリケーションを実行！（安全装置の変数を渡す）
+        // 解像度はClient側に合わせてください（例: 320, 240 または 640, 360など）
+        StreamApp app(1234, "EV Camera Stream", 320, 240, mode);
+
         app.run(keep_running);
 
     } catch (const std::exception& e) {
