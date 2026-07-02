@@ -12,6 +12,42 @@ void StreamApp::run(const std::atomic<bool>& keep_running) {
 
     receiver_.start();
 
+    // 描画用の参照を受け取るためのポインタ
+    AVFrame* current_frame = nullptr;
+
+    while (keep_running) {
+        if (!renderer_.poll_events()) {
+            break;
+        }
+
+        // ポインタ（参照）だけを受け取るので、メモリコピーが一切発生しない
+        if (receiver_.get_latest_frame(&current_frame)) {
+            
+            // そのまま描画機へ
+            renderer_.render_frame(current_frame);
+            
+            // ⚠️超重要: 使い終わった参照（鍵）は必ず返却する（メモリリーク防止）
+            av_frame_free(&current_frame);
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    std::cout << "\n終了シグナルを受信。システムを停止します..." << std::endl;
+}#include "stream_app.hpp"
+#include <iostream>
+#include <chrono>
+
+StreamApp::StreamApp(int port, const std::string& title, int width, int height, DecodeMode mode)
+    : receiver_(port, mode), renderer_(title, width, height) {
+}
+
+void StreamApp::run(const std::atomic<bool>& keep_running) {
+    std::cout << "画面の準備完了。映像の受信を待っています...\n" << std::endl;
+    std::cout << "(終了するには画面の×ボタンか、ターミナルでCtrl+C)\n" << std::endl;
+
+    receiver_.start();
+
     while (keep_running) {
         if (!renderer_.poll_events()) {
             break;
@@ -67,6 +103,58 @@ void StreamApp::run(const std::atomic<bool>& keep_running) {
 
     std::cout << "\n終了シグナルを受信。システムを停止します..." << std::endl;
     // receiver_ はクラスの破棄と同時に自動で安全に stop() されます（RAIIの力）
+}#include "stream_app.hpp"
+#include <iostream>
+#include <chrono>
+
+StreamApp::StreamApp(int port, const std::string& title, int width, int height, DecodeMode mode)
+    : receiver_(port, mode), renderer_(title, width, height) {
+}
+
+void StreamApp::run(const std::atomic<bool>& keep_running) {
+    std::cout << "画面の準備完了。映像の受信を待っています...\n" << std::endl;
+    
+    receiver_.start();
+    AVFrame* current_frame = nullptr;
+
+    // ★ ffplay化の心臓部：30fpsのペーシング（1フレームあたり33.3ミリ秒）
+    const auto frame_duration = std::chrono::milliseconds(33); 
+    auto next_render_time = std::chrono::steady_clock::now();
+
+    while (keep_running) {
+        if (!renderer_.poll_events()) {
+            break;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        
+        // ★ 次のフレームを描画する時間が来たか？
+        if (now >= next_render_time) {
+            
+            if (receiver_.get_latest_frame(&current_frame)) {
+                // 時間通りに描画機へ！
+                renderer_.render_frame(current_frame);
+                av_frame_free(&current_frame);
+                
+                // 次の描画目標時間を33ms後に設定
+                next_render_time += frame_duration;
+                
+                // ネットワークが途切れて時間が大きくズレた場合は、現在時刻にリセット（早送り現象の防止）
+                if (now > next_render_time + frame_duration) {
+                    next_render_time = now;
+                }
+            } else {
+                // キューが空っぽ（パケット到着待ち）なので少し休む
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            
+        } else {
+            // まだ描画のタイミングではない（ペースを保つために休む）
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    std::cout << "\n終了シグナルを受信。システムを停止します..." << std::endl;
 }#ifndef STREAM_APP_HPP_
 #define STREAM_APP_HPP_
 
@@ -208,6 +296,227 @@ bool SdlRenderer::poll_events() {
         }
     }
     return true; // まだ続けてOK
+}#include "display/sdl_renderer.hpp"
+#include <stdexcept>
+#include <iostream>
+
+SdlRenderer::SdlRenderer(const std::string& title, int width, int height)
+    : width_(width), height_(height) {
+    
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        throw std::runtime_error(std::string("エラー: SDL2の初期化に失敗 -> ") + SDL_GetError());
+    }
+
+    window_ = SDL_CreateWindow(
+        title.c_str(),
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        width_, height_,
+        SDL_WINDOW_SHOWN
+    );
+    if (!window_) {
+        throw std::runtime_error(std::string("エラー: ウィンドウの作成に失敗 -> ") + SDL_GetError());
+    }
+
+    //renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED);
+    if (!renderer_) {
+        throw std::runtime_error(std::string("エラー: レンダラーの作成に失敗 -> ") + SDL_GetError());
+    }
+
+    texture_ = SDL_CreateTexture(
+        renderer_,
+        SDL_PIXELFORMAT_IYUV,
+        SDL_TEXTUREACCESS_STREAMING,
+        width_, height_
+    );
+    if (!texture_) {
+        throw std::runtime_error(std::string("エラー: テクスチャの作成に失敗 -> ") + SDL_GetError());
+    }
+}
+
+SdlRenderer::~SdlRenderer() {
+    if (texture_) SDL_DestroyTexture(texture_);
+    if (renderer_) SDL_DestroyRenderer(renderer_);
+    if (window_) SDL_DestroyWindow(window_);
+    SDL_Quit();
+}
+
+void SdlRenderer::render_frame(const AVFrame* frame) {
+    if (!frame) return;
+
+    // GPUのキャンバス（テクスチャ）に、AVFrameのYUVデータを直接流し込む！
+    SDL_UpdateYUVTexture(
+        texture_,
+        nullptr,
+        frame->data[0], frame->linesize[0],
+        frame->data[1], frame->linesize[1],
+        frame->data[2], frame->linesize[2]
+    );
+
+    SDL_RenderClear(renderer_);
+    SDL_RenderCopy(renderer_, texture_, nullptr, nullptr);
+    SDL_RenderPresent(renderer_);
+}
+
+bool SdlRenderer::poll_events() {
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_QUIT) {
+            return false;
+        }
+        if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {
+            return false;
+        }
+    }
+    return true;
+}#include "display/sdl_renderer.hpp"
+#include <stdexcept>
+#include <iostream>
+
+SdlRenderer::SdlRenderer(const std::string& title, int width, int height)
+    : width_(width), height_(height) {
+    
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        throw std::runtime_error(std::string("エラー: SDL2の初期化に失敗 -> ") + SDL_GetError());
+    }
+
+    window_ = SDL_CreateWindow(
+        title.c_str(),
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        width_, height_,
+        SDL_WINDOW_SHOWN
+    );
+    if (!window_) {
+        throw std::runtime_error(std::string("エラー: ウィンドウの作成に失敗 -> ") + SDL_GetError());
+    }
+
+    renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!renderer_) {
+        throw std::runtime_error(std::string("エラー: レンダラーの作成に失敗 -> ") + SDL_GetError());
+    }
+
+    texture_ = SDL_CreateTexture(
+        renderer_,
+        SDL_PIXELFORMAT_IYUV,
+        SDL_TEXTUREACCESS_STREAMING,
+        width_, height_
+    );
+    if (!texture_) {
+        throw std::runtime_error(std::string("エラー: テクスチャの作成に失敗 -> ") + SDL_GetError());
+    }
+}
+
+SdlRenderer::~SdlRenderer() {
+    if (texture_) SDL_DestroyTexture(texture_);
+    if (renderer_) SDL_DestroyRenderer(renderer_);
+    if (window_) SDL_DestroyWindow(window_);
+    SDL_Quit();
+}
+
+void SdlRenderer::render_frame(const AVFrame* frame) {
+    if (!frame) return;
+
+    // GPUのキャンバス（テクスチャ）に、AVFrameのYUVデータを直接流し込む！
+    SDL_UpdateYUVTexture(
+        texture_,
+        nullptr,
+        frame->data[0], frame->linesize[0],
+        frame->data[1], frame->linesize[1],
+        frame->data[2], frame->linesize[2]
+    );
+
+    SDL_RenderClear(renderer_);
+    SDL_RenderCopy(renderer_, texture_, nullptr, nullptr);
+    SDL_RenderPresent(renderer_);
+}
+
+bool SdlRenderer::poll_events() {
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_QUIT) {
+            return false;
+        }
+        if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {
+            return false;
+        }
+    }
+    return true;
+}#include "display/sdl_renderer.hpp"
+#include <stdexcept>
+#include <iostream>
+
+SdlRenderer::SdlRenderer(const std::string& title, int width, int height)
+    : width_(width), height_(height) {
+    
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        throw std::runtime_error(std::string("エラー: SDL2の初期化に失敗 -> ") + SDL_GetError());
+    }
+
+    window_ = SDL_CreateWindow(
+        title.c_str(),
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        width_, height_,
+        SDL_WINDOW_SHOWN
+    );
+    if (!window_) {
+        throw std::runtime_error(std::string("エラー: ウィンドウの作成に失敗 -> ") + SDL_GetError());
+    }
+
+    // =======================================================================
+    // ★ 究極の対策B：VSYNCを復元し、天然の整流器として利用する
+    // =======================================================================
+    // モニターのリフレッシュレートに描画を合わせることで、UDPの不規則な到着を
+    // 最適なペースで平滑化し、微細なカクつき（ジッタ）を吸収します。
+    renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!renderer_) {
+        throw std::runtime_error(std::string("エラー: レンダラーの作成に失敗 -> ") + SDL_GetError());
+    }
+
+    texture_ = SDL_CreateTexture(
+        renderer_,
+        SDL_PIXELFORMAT_IYUV,
+        SDL_TEXTUREACCESS_STREAMING,
+        width_, height_
+    );
+    if (!texture_) {
+        throw std::runtime_error(std::string("エラー: テクスチャの作成に失敗 -> ") + SDL_GetError());
+    }
+}
+
+SdlRenderer::~SdlRenderer() {
+    if (texture_) SDL_DestroyTexture(texture_);
+    if (renderer_) SDL_DestroyRenderer(renderer_);
+    if (window_) SDL_DestroyWindow(window_);
+    SDL_Quit();
+}
+
+void SdlRenderer::render_frame(const AVFrame* frame) {
+    if (!frame) return;
+
+    SDL_UpdateYUVTexture(
+        texture_,
+        nullptr,
+        frame->data[0], frame->linesize[0],
+        frame->data[1], frame->linesize[1],
+        frame->data[2], frame->linesize[2]
+    );
+
+    SDL_RenderClear(renderer_);
+    SDL_RenderCopy(renderer_, texture_, nullptr, nullptr);
+    SDL_RenderPresent(renderer_);
+}
+
+bool SdlRenderer::poll_events() {
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_QUIT) {
+            return false;
+        }
+        if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {
+            return false;
+        }
+    }
+    return true;
 }/**
  * @file sdl_renderer.hpp
  * @brief 解凍された生ピクセル（YUV）を画面に超低遅延で描画する部品
@@ -249,7 +558,302 @@ bool SdlRenderer::poll_events() {
      int height_;
  };
  
- #endif#include "stream/udp_receiver.hpp"
+ #endif/**
+ * @file sdl_renderer.hpp
+ * @brief 解凍された生ピクセルを画面に超低遅延で描画する部品
+ */
+#ifndef SDL_RENDERER_HPP_
+#define SDL_RENDERER_HPP_
+
+#include <SDL2/SDL.h>
+#include <string>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
+
+class SdlRenderer {
+public:
+    SdlRenderer(const std::string& title, int width, int height);
+    ~SdlRenderer();
+
+    SdlRenderer(const SdlRenderer&) = delete;
+    SdlRenderer& operator=(const SdlRenderer&) = delete;
+
+    // AVFrame のポインタを直接受け取るように変更
+    void render_frame(const AVFrame* frame);
+    bool poll_events();
+
+private:
+    SDL_Window* window_ = nullptr;
+    SDL_Renderer* renderer_ = nullptr;
+    SDL_Texture* texture_ = nullptr;
+
+    int width_;
+    int height_;
+};
+
+#endif/**
+ * @file sdl_renderer.hpp
+ * @brief 解凍された生ピクセルを画面に超低遅延で描画する部品
+ */
+#ifndef SDL_RENDERER_HPP_
+#define SDL_RENDERER_HPP_
+
+#include <SDL2/SDL.h>
+#include <string>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
+
+class SdlRenderer {
+public:
+    SdlRenderer(const std::string& title, int width, int height);
+    ~SdlRenderer();
+
+    SdlRenderer(const SdlRenderer&) = delete;
+    SdlRenderer& operator=(const SdlRenderer&) = delete;
+
+    // AVFrame のポインタを直接受け取るように変更
+    void render_frame(const AVFrame* frame);
+    bool poll_events();
+
+private:
+    SDL_Window* window_ = nullptr;
+    SDL_Renderer* renderer_ = nullptr;
+    SDL_Texture* texture_ = nullptr;
+
+    int width_;
+    int height_;
+};
+
+#endif#include "display/sdl_renderer.hpp"
+#include <stdexcept>
+#include <iostream>
+
+SdlRenderer::SdlRenderer(const std::string& title, int width, int height)
+    : width_(width), height_(height) {
+    
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        throw std::runtime_error(std::string("エラー: SDL2の初期化に失敗 -> ") + SDL_GetError());
+    }
+
+    window_ = SDL_CreateWindow(
+        title.c_str(),
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        width_, height_,
+        SDL_WINDOW_SHOWN
+    );
+    if (!window_) {
+        throw std::runtime_error(std::string("エラー: ウィンドウの作成に失敗 -> ") + SDL_GetError());
+    }
+
+    // =======================================================================
+    // ★ 究極の対策B：VSYNCを復元し、天然の整流器として利用する
+    // =======================================================================
+    // モニターのリフレッシュレートに描画を合わせることで、UDPの不規則な到着を
+    // 最適なペースで平滑化し、微細なカクつき（ジッタ）を吸収します。
+    renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!renderer_) {
+        throw std::runtime_error(std::string("エラー: レンダラーの作成に失敗 -> ") + SDL_GetError());
+    }
+
+    texture_ = SDL_CreateTexture(
+        renderer_,
+        SDL_PIXELFORMAT_IYUV,
+        SDL_TEXTUREACCESS_STREAMING,
+        width_, height_
+    );
+    if (!texture_) {
+        throw std::runtime_error(std::string("エラー: テクスチャの作成に失敗 -> ") + SDL_GetError());
+    }
+}
+
+SdlRenderer::~SdlRenderer() {
+    if (texture_) SDL_DestroyTexture(texture_);
+    if (renderer_) SDL_DestroyRenderer(renderer_);
+    if (window_) SDL_DestroyWindow(window_);
+    SDL_Quit();
+}
+
+void SdlRenderer::render_frame(const AVFrame* frame) {
+    if (!frame) return;
+
+    SDL_UpdateYUVTexture(
+        texture_,
+        nullptr,
+        frame->data[0], frame->linesize[0],
+        frame->data[1], frame->linesize[1],
+        frame->data[2], frame->linesize[2]
+    );
+
+    SDL_RenderClear(renderer_);
+    SDL_RenderCopy(renderer_, texture_, nullptr, nullptr);
+    SDL_RenderPresent(renderer_);
+}
+
+bool SdlRenderer::poll_events() {
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_QUIT) {
+            return false;
+        }
+        if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {
+            return false;
+        }
+    }
+    return true;
+}#include "stream/udp_receiver.hpp"
+#include <stdexcept>
+#include <iostream>
+
+UdpReceiver::UdpReceiver(int port) {
+    // ネットワーク機能の初期化
+    avformat_network_init();
+
+    // 待ち受けURL（0.0.0.0 は「どのIPから飛んできても受け止める」という指定）
+    std::string url = "udp://0.0.0.0:" + std::to_string(port);
+
+    // =======================================================
+    // ★ 遠隔操作EV用：バッファリングを殺す「超低遅延マジック」
+    // =======================================================
+    AVDictionary* options = nullptr;
+    av_dict_set(&options, "fflags", "nobuffer", 0); // データを一切溜め込まない
+    av_dict_set(&options, "flags", "low_delay", 0); // 低遅延モード強制
+    av_dict_set(&options, "max_delay", "0", 0);     // 待機時間ゼロ
+
+    fmt_ctx_ = avformat_alloc_context();
+
+    // 扉（ポート）を開けて、通信の受け入れを開始する
+    if (avformat_open_input(&fmt_ctx_, url.c_str(), nullptr, &options) < 0) {
+        throw std::runtime_error("エラー: UDPポート " + std::to_string(port) + " を開けませんでした");
+    }
+    av_dict_free(&options); // オプション設定用のメモリを解放
+
+    // 飛んできたMPEG-TSの中から、ストリーム（映像や音声の通り道）の情報を探り出す
+    if (avformat_find_stream_info(fmt_ctx_, nullptr) < 0) {
+        throw std::runtime_error("エラー: ストリーム情報が見つかりません");
+    }
+
+    // 複数あるかもしれないレーンの中から「映像（VIDEO）」が流れているレーン番号を特定する
+    for (unsigned int i = 0; i < fmt_ctx_->nb_streams; i++) {
+        if (fmt_ctx_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_stream_index_ = i;
+            break;
+        }
+    }
+
+    if (video_stream_index_ == -1) {
+        throw std::runtime_error("エラー: ビデオストリームが見つかりません");
+    }
+
+    // データを受け取るための空のカプセルを用意
+    pkt_ = av_packet_alloc();
+}
+
+UdpReceiver::~UdpReceiver() {
+    // 扉を閉めてメモリを掃除する
+    if (pkt_) av_packet_free(&pkt_);
+    if (fmt_ctx_) avformat_close_input(&fmt_ctx_);
+    avformat_network_deinit();
+}
+
+bool UdpReceiver::receive_packet(std::vector<uint8_t>& out_h264_data) {
+    // ネットワークからカプセル（パケット）を1つ取り出す
+    // ※データが届いていない場合は、届くまでここで一瞬「待機（ブロック）」してくれます
+    int ret = av_read_frame(fmt_ctx_, pkt_);
+    if (ret < 0) {
+        return false; // 通信切断やエラー
+    }
+
+    bool success = false;
+    // 取り出したカプセルが「映像レーン」のものか確認する（音声などのゴミを弾く）
+    if (pkt_->stream_index == video_stream_index_) {
+        // カプセルの中身（H.264データ）を、C++の安全な配列にコピーして渡す
+        out_h264_data.assign(pkt_->data, pkt_->data + pkt_->size);
+        success = true;
+    }
+
+    // 次の受信に備えてカプセルを空っぽにする
+    av_packet_unref(pkt_); 
+    return success;
+}#include "stream/udp_receiver.hpp"
+#include <stdexcept>
+#include <iostream>
+
+UdpReceiver::UdpReceiver(int port) {
+    // ネットワーク機能の初期化
+    avformat_network_init();
+
+    // 待ち受けURL（0.0.0.0 は「どのIPから飛んできても受け止める」という指定）
+    //std::string url = "udp://0.0.0.0:" + std::to_string(port);
+    std::string url = "udp://0.0.0.0:" + std::to_string(port) + "?buffer_size=1024000";
+
+    // =======================================================
+    // ★ 遠隔操作EV用：バッファリングを殺す「超低遅延マジック」
+    // =======================================================
+    AVDictionary* options = nullptr;
+    av_dict_set(&options, "fflags", "nobuffer", 0); // データを一切溜め込まない
+    av_dict_set(&options, "flags", "low_delay", 0); // 低遅延モード強制
+    av_dict_set(&options, "max_delay", "0", 0);     // 待機時間ゼロ
+
+    fmt_ctx_ = avformat_alloc_context();
+
+    // 扉（ポート）を開けて、通信の受け入れを開始する
+    if (avformat_open_input(&fmt_ctx_, url.c_str(), nullptr, &options) < 0) {
+        throw std::runtime_error("エラー: UDPポート " + std::to_string(port) + " を開けませんでした");
+    }
+    av_dict_free(&options); // オプション設定用のメモリを解放
+
+    // 飛んできたMPEG-TSの中から、ストリーム（映像や音声の通り道）の情報を探り出す
+    if (avformat_find_stream_info(fmt_ctx_, nullptr) < 0) {
+        throw std::runtime_error("エラー: ストリーム情報が見つかりません");
+    }
+
+    // 複数あるかもしれないレーンの中から「映像（VIDEO）」が流れているレーン番号を特定する
+    for (unsigned int i = 0; i < fmt_ctx_->nb_streams; i++) {
+        if (fmt_ctx_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_stream_index_ = i;
+            break;
+        }
+    }
+
+    if (video_stream_index_ == -1) {
+        throw std::runtime_error("エラー: ビデオストリームが見つかりません");
+    }
+
+    // データを受け取るための空のカプセルを用意
+    pkt_ = av_packet_alloc();
+}
+
+UdpReceiver::~UdpReceiver() {
+    // 扉を閉めてメモリを掃除する
+    if (pkt_) av_packet_free(&pkt_);
+    if (fmt_ctx_) avformat_close_input(&fmt_ctx_);
+    avformat_network_deinit();
+}
+
+bool UdpReceiver::receive_packet(std::vector<uint8_t>& out_h264_data) {
+    // ネットワークからカプセル（パケット）を1つ取り出す
+    // ※データが届いていない場合は、届くまでここで一瞬「待機（ブロック）」してくれます
+    int ret = av_read_frame(fmt_ctx_, pkt_);
+    if (ret < 0) {
+        return false; // 通信切断やエラー
+    }
+
+    bool success = false;
+    // 取り出したカプセルが「映像レーン」のものか確認する（音声などのゴミを弾く）
+    if (pkt_->stream_index == video_stream_index_) {
+        // カプセルの中身（H.264データ）を、C++の安全な配列にコピーして渡す
+        out_h264_data.assign(pkt_->data, pkt_->data + pkt_->size);
+        success = true;
+    }
+
+    // 次の受信に備えてカプセルを空っぽにする
+    av_packet_unref(pkt_); 
+    return success;
+}#include "stream/udp_receiver.hpp"
 #include <stdexcept>
 #include <iostream>
 
@@ -521,6 +1125,118 @@ int main() {
     return 0;
 }#include <iostream>
 #include <csignal>
+#include <cstdlib>
+#include <atomic>
+#include <thread>
+#include <chrono>
+
+std::atomic<bool> keep_running(true);
+
+void signal_handler(int) {
+    keep_running = false;
+}
+
+int main() {
+    std::signal(SIGINT, signal_handler);
+    std::cout << "--- 映像伝送 Server (ffplayネイティブ版) 起動 ---" << std::endl;
+
+    int port = 1234;
+
+    // 実行するffplayコマンドを組み立てる
+    // -x 640 -y 480 でウィンドウサイズを指定し、裏側（&）で実行
+    std::string cmd = "ffplay -fflags nobuffer -flags low_delay -framedrop -strict experimental -x 640 -y 480 udp://@:" 
+                      + std::to_string(port) + " > /dev/null 2>&1 &";
+
+    std::cout << "[システム] 以下のコマンドで受信画面を起動します:\n" << cmd << std::endl;
+    
+    // コマンドを実行！（ここでポンッとffplayの画面が開きます）
+    std::system(cmd.c_str());
+
+    std::cout << "(終了するにはターミナルで Ctrl+C を押してください)\n" << std::endl;
+
+    // メインスレッドは終了の合図が来るまで待機
+    while (keep_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    std::cout << "\n終了シグナルを受信。受信画面を停止します..." << std::endl;
+    
+    // プログラム終了時にffplayのウィンドウも強制終了して閉じる
+    std::system("pkill -f 'ffplay -fflags nobuffer'");
+
+    return 0;
+}#include <iostream>
+#include <csignal>
+#include <atomic>
+#include "stream_app.hpp"
+
+// メインスレッド終了用の安全装置
+std::atomic<bool> keep_running(true);
+void signal_handler(int) {
+    keep_running = false;
+}
+
+int main() {
+    std::signal(SIGINT, signal_handler);
+    std::cout << "--- 映像伝送 Server (受信側) 起動 ---" << std::endl;
+    
+    try {
+        // =================================================================================
+        // これにより h264_decoder.cpp 内部で、自動的にCPU4コアをフル活用する超低遅延設定
+        // DecodeMode::Software_CPU : CPU4コア全開の超低遅延モード
+        // DecodeMode::Hardware_Pi4 : GPU専用チップのエコモード
+    
+        DecodeMode mode = DecodeMode::Software_CPU;
+
+        // 解像度をClient側（640x360）と同期
+        StreamApp app(1234, "EV Camera Stream", 640, 480, mode);
+        
+        // アプリケーションを実行
+        app.run(keep_running);
+
+    } catch (const std::exception& e) {
+        std::cerr << "\n[致命的なエラー] " << e.what() << std::endl;
+        return -1;
+    }
+
+    return 0;
+}#include <iostream>
+#include <csignal>
+#include <atomic>
+#include "stream_app.hpp"
+
+// メインスレッド終了用の安全装置
+std::atomic<bool> keep_running(true);
+void signal_handler(int) {
+    keep_running = false;
+}
+
+int main() {
+    std::signal(SIGINT, signal_handler);
+    std::cout << "--- 映像伝送 Server (受信側) 起動 ---" << std::endl;
+    
+    try {
+        // =================================================================================
+        // これにより h264_decoder.cpp 内部で、自動的にCPU4コアをフル活用する超低遅延設定
+        // DecodeMode::Software_CPU : CPU4コア全開の超低遅延モード
+        // DecodeMode::Hardware_Pi4 : GPU専用チップのエコモード
+    
+        DecodeMode mode = DecodeMode::Software_CPU;
+
+        // 解像度をClient側（640x360）と同期
+        StreamApp app(1234, "EV Camera Stream", 640, 360, mode);
+        
+        // アプリケーションを実行
+        app.run(keep_running);
+
+    } catch (const std::exception& e) {
+        std::cerr << "\n[致命的なエラー] " << e.what() << std::endl;
+        return -1;
+    }
+
+    return 0;
+}#include <iostream>
+#include <csignal>
 #include <atomic>
 #include "stream_app.hpp"
 
@@ -620,6 +1336,41 @@ int main() {
 #include <atomic>
 #include "stream_app.hpp"
 
+// メインスレッド終了用の安全装置
+std::atomic<bool> keep_running(true);
+void signal_handler(int) {
+    keep_running = false;
+}
+
+int main() {
+    std::signal(SIGINT, signal_handler);
+    std::cout << "--- 映像伝送 Server (受信側) 起動 ---" << std::endl;
+    
+    try {
+        // =================================================================================
+        // ★ 変更箇所：ラズパイ5環境への最適化
+        // =================================================================================
+        // ラズパイ5はハードウェアデコーダを持たないため、ソフトウェアモード（CPU解凍）を指定します。
+        // これにより h264_decoder.cpp 内部で、自動的にCPU4コアをフル活用する超低遅延設定が発動します。
+        DecodeMode mode = DecodeMode::Software_CPU;
+
+        // 解像度をClient側（640x360）と完全に一致させます。
+        StreamApp app(1234, "EV Camera Stream", 640, 360, mode);
+        
+        // アプリケーションを実行
+        app.run(keep_running);
+
+    } catch (const std::exception& e) {
+        std::cerr << "\n[致命的なエラー] " << e.what() << std::endl;
+        return -1;
+    }
+
+    return 0;
+}#include <iostream>
+#include <csignal>
+#include <atomic>
+#include "stream_app.hpp"
+
 std::atomic<bool> keep_running(true);
 void signal_handler(int) {
     keep_running = false;
@@ -638,6 +1389,41 @@ int main() {
         // 解像度はClient側に合わせてください（例: 320, 240 または 640, 360など）
         StreamApp app(1234, "EV Camera Stream", 320, 240, mode);
 
+        app.run(keep_running);
+
+    } catch (const std::exception& e) {
+        std::cerr << "\n[致命的なエラー] " << e.what() << std::endl;
+        return -1;
+    }
+
+    return 0;
+}#include <iostream>
+#include <csignal>
+#include <atomic>
+#include "stream_app.hpp"
+
+// メインスレッド終了用の安全装置
+std::atomic<bool> keep_running(true);
+void signal_handler(int) {
+    keep_running = false;
+}
+
+int main() {
+    std::signal(SIGINT, signal_handler);
+    std::cout << "--- 映像伝送 Server (受信側) 起動 ---" << std::endl;
+    
+    try {
+        // =================================================================================
+        // これにより h264_decoder.cpp 内部で、自動的にCPU4コアをフル活用する超低遅延設定
+        // DecodeMode::Software_CPU : CPU4コア全開の超低遅延モード
+        // DecodeMode::Hardware_Pi4 : GPU専用チップのエコモード
+    
+        DecodeMode mode = DecodeMode::Software_CPU;
+
+        // 解像度をClient側（640x360）と同期
+        StreamApp app(1234, "EV Camera Stream", 640, 480, mode);
+        
+        // アプリケーションを実行
         app.run(keep_running);
 
     } catch (const std::exception& e) {
@@ -704,6 +1490,29 @@ int main() {
 
     return 0;
 }/**
+ * @file stream_app.hpp
+ * @brief 受信と描画を統合して管理するアプリケーションクラス
+ */
+#ifndef STREAM_APP_HPP_
+#define STREAM_APP_HPP_
+
+#include <atomic>
+#include "stream/receiver_thread.hpp"
+#include "display/sdl_renderer.hpp"
+
+class StreamApp {
+public:
+    StreamApp(int port, const std::string& title, int width, int height, DecodeMode mode);
+    ~StreamApp() = default;
+
+    void run(const std::atomic<bool>& keep_running);
+
+private:
+    ReceiverThread receiver_;
+    SdlRenderer renderer_;
+};
+
+#endif/**
  * @file stream_app.hpp
  * @brief 受信と描画を統合して管理するアプリケーションクラス
  */
@@ -854,6 +1663,115 @@ inline void init_logger()
 #include "stream/receiver_thread.hpp"
 #include <iostream>
 
+ReceiverThread::ReceiverThread(int port, DecodeMode mode) : port_(port), mode_(mode) {
+    latest_frame_ = av_frame_alloc();
+}
+
+ReceiverThread::~ReceiverThread() {
+    stop();
+    if (latest_frame_) {
+        av_frame_free(&latest_frame_);
+    }
+}
+
+void ReceiverThread::start() {
+    stop_flag_.store(false);
+    worker_ = std::thread(&ReceiverThread::thread_loop, this);
+}
+
+void ReceiverThread::stop() {
+    stop_flag_.store(true);
+    if (worker_.joinable()) {
+        worker_.detach();
+    }
+}
+
+bool ReceiverThread::get_latest_frame(AVFrame** out_frame) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!has_new_frame_ || !latest_frame_) return false;
+
+    // 【ゼロコピーの魔法】実体はコピーせず「参照カウンタ」だけを増やして外に貸し出す
+    *out_frame = av_frame_clone(latest_frame_);
+    
+    has_new_frame_ = false;
+    return true;
+}
+
+void ReceiverThread::thread_loop() {
+    try {
+        std::cout << "[裏方スレッド] 受信機と解凍機を準備中..." << std::endl;
+        UdpReceiver receiver(port_);
+        H264Decoder decoder(mode_);
+
+        std::vector<uint8_t> h264_data;
+        AVFrame* decoded_frame = av_frame_alloc();
+
+        std::cout << "[裏方スレッド] >>> パケット受信待機中 (Port: " << port_ << ") <<<" << std::endl;
+
+        while (!stop_flag_.load(std::memory_order_relaxed)) {
+            if (receiver.receive_packet(h264_data)) {
+                if (decoder.decode_packet(h264_data, decoded_frame)) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    
+                    // 古い映像の参照を破棄し、新しい映像の参照をセットする（一瞬で終わる）
+                    av_frame_unref(latest_frame_);
+                    av_frame_ref(latest_frame_, decoded_frame);
+                    
+                    has_new_frame_ = true;
+                }
+            }
+        }
+        av_frame_free(&decoded_frame);
+    } catch (const std::exception& e) {
+        std::cerr << "[裏方スレッド エラー] " << e.what() << std::endl;
+    }
+}/**
+ * @file receiver_thread.hpp
+ * @brief パケット受信とH.264解凍を裏方で回し続ける司令塔
+ */
+#ifndef RECEIVER_THREAD_HPP_
+#define RECEIVER_THREAD_HPP_
+
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <vector>
+
+#include "stream/udp_receiver.hpp"
+#include "stream/h264_decoder.hpp"
+
+class ReceiverThread {
+public:
+    ReceiverThread(int port, DecodeMode mode);
+    ~ReceiverThread();
+
+    ReceiverThread(const ReceiverThread&) = delete;
+    ReceiverThread& operator=(const ReceiverThread&) = delete;
+
+    void start();
+    void stop();
+
+    // 描画側へ AVFrame の参照（ポインタ）を渡す関数
+    bool get_latest_frame(AVFrame** out_frame);
+
+private:
+    int port_;
+    DecodeMode mode_;
+    std::thread worker_;
+    std::atomic<bool> stop_flag_{false};
+
+    std::mutex mutex_;
+    bool has_new_frame_ = false;
+    
+    // std::vector を廃止！ FFmpegのフレームを直接保持する
+    AVFrame* latest_frame_ = nullptr;
+
+    void thread_loop();
+};
+
+#endif#include "stream/receiver_thread.hpp"
+#include <iostream>
+
 ReceiverThread::ReceiverThread(int port) : port_(port) {}
 
 ReceiverThread::~ReceiverThread() {
@@ -936,6 +1854,80 @@ void ReceiverThread::thread_loop() {
 }#include "stream/receiver_thread.hpp"
 #include <iostream>
 
+ReceiverThread::ReceiverThread(int port, DecodeMode mode) : port_(port), mode_(mode) {
+}
+
+ReceiverThread::~ReceiverThread() {
+    stop();
+    // キューに残ったフレームをすべて綺麗に掃除
+    std::lock_guard<std::mutex> lock(mutex_);
+    while (!frame_queue_.empty()) {
+        AVFrame* f = frame_queue_.front();
+        frame_queue_.pop();
+        av_frame_free(&f);
+    }
+}
+
+void ReceiverThread::start() {
+    stop_flag_.store(false);
+    worker_ = std::thread(&ReceiverThread::thread_loop, this);
+}
+
+void ReceiverThread::stop() {
+    stop_flag_.store(true);
+    if (worker_.joinable()) {
+        worker_.detach();
+    }
+}
+
+bool ReceiverThread::get_latest_frame(AVFrame** out_frame) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (frame_queue_.empty()) return false;
+
+    // ★ キューの先頭（一番古いフレーム）から順番に取り出す
+    *out_frame = frame_queue_.front();
+    frame_queue_.pop();
+    
+    return true;
+}
+
+void ReceiverThread::thread_loop() {
+    try {
+        std::cout << "[裏方スレッド] 受信機と解凍機を準備中..." << std::endl;
+        UdpReceiver receiver(port_);
+        H264Decoder decoder(mode_);
+
+        std::vector<uint8_t> h264_data;
+        AVFrame* decoded_frame = av_frame_alloc();
+
+        std::cout << "[裏方スレッド] >>> パケット受信待機中 (Port: " << port_ << ") <<<" << std::endl;
+
+        while (!stop_flag_.load(std::memory_order_relaxed)) {
+            if (receiver.receive_packet(h264_data)) {
+                if (decoder.decode_packet(h264_data, decoded_frame)) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    
+                    // ★ 上書きではなく、列の最後尾に追加（クローン）する
+                    frame_queue_.push(av_frame_clone(decoded_frame));
+                    
+                    // ★ 遠隔操作の命「超低遅延」を守るための安全装置
+                    // ネットワークが詰まってバッファが溜まりすぎた場合、一番古いものを捨てて
+                    // 遅延を最大約160ms（5フレーム）以内に強制維持する
+                    if (frame_queue_.size() > 5) {
+                        AVFrame* old = frame_queue_.front();
+                        frame_queue_.pop();
+                        av_frame_free(&old);
+                    }
+                }
+            }
+        }
+        av_frame_free(&decoded_frame);
+    } catch (const std::exception& e) {
+        std::cerr << "[裏方スレッド エラー] " << e.what() << std::endl;
+    }
+}#include "stream/receiver_thread.hpp"
+#include <iostream>
+
 ReceiverThread::ReceiverThread(int port, DecodeMode mode) : port_(port), mode_(mode) {}
 
 ReceiverThread::~ReceiverThread() {
@@ -1007,6 +1999,43 @@ void ReceiverThread::thread_loop() {
         std::cerr << "[裏方スレッド エラー] " << e.what() << std::endl;
     }
 }/**
+ * @file udp_receiver.hpp
+ * @brief UDPで飛んできたMPEG-TSを受け止め、H.264データを抽出する部品
+ */
+
+ #ifndef UDP_RECEIVER_HPP_
+ #define UDP_RECEIVER_HPP_
+ 
+ #include <vector>
+ #include <cstdint>
+ #include <string>
+ 
+ extern "C" {
+ #include <libavformat/avformat.h>
+ }
+ 
+ class UdpReceiver {
+ public:
+     // ① 準備：待ち受けするポート番号（例: 1234）を指定する
+     explicit UdpReceiver(int port);
+     
+     // ② 後片付け：ポートを閉じて通信を綺麗に終了する
+     ~UdpReceiver();
+ 
+     // コピー禁止のおまじない（通信ポートを扱うクラスの鉄則）
+     UdpReceiver(const UdpReceiver&) = delete;
+     UdpReceiver& operator=(const UdpReceiver&) = delete;
+ 
+     // ③ メイン処理：ネットワークからH.264の塊を1つ受け取る
+     bool receive_packet(std::vector<uint8_t>& out_h264_data);
+ 
+ private:
+     AVFormatContext* fmt_ctx_ = nullptr; // 受信と解体の「ルールブック」
+     AVPacket* pkt_ = nullptr;            // 受け取ったデータを入れる「カプセル」
+     int video_stream_index_ = -1;        // 映像データが流れているレーンの番号
+ };
+ 
+ #endif/**
  * @file udp_receiver.hpp
  * @brief UDPで飛んできたMPEG-TSを受け止め、H.264データを抽出する部品
  */
@@ -1322,6 +2351,65 @@ bool H264Decoder::decode_packet(const std::vector<uint8_t>& h264_data, YuvFrame&
     }
 
     return false; // まだ絵が完成していない
+}#include "stream/h264_decoder.hpp"
+#include <stdexcept>
+#include <iostream>
+
+H264Decoder::H264Decoder(DecodeMode mode) {
+    const AVCodec* codec = nullptr;
+    if (mode == DecodeMode::Hardware_Pi4) {
+        codec = avcodec_find_decoder_by_name("h264_v4l2m2m");
+        if (!codec) throw std::runtime_error("エラー: ハードウェアデコーダが見つかりません");
+    } else {
+        codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+        if (!codec) throw std::runtime_error("エラー: ソフトウェアデコーダが見つかりません");
+    }
+
+    codec_ctx_ = avcodec_alloc_context3(codec);
+    if (!codec_ctx_) {
+        throw std::runtime_error("エラー: デコーダの設定データを作れません");
+    }
+
+    if (mode == DecodeMode::Software_CPU) {
+        codec_ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        
+        // =======================================================================
+        // ★ 究極の対策A：パケットロス時のフリーズ（カクつき）を強制回避する
+        // =======================================================================
+        // データが欠損してもフレームを破棄せず、エラーを推測して無理やり出力する
+        codec_ctx_->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;
+        codec_ctx_->error_concealment = FF_EC_GUESS_MVS | FF_EC_DEBLOCK;
+
+        codec_ctx_->thread_type = FF_THREAD_SLICE;
+        codec_ctx_->thread_count = 4;
+    }
+
+    if (avcodec_open2(codec_ctx_, codec, nullptr) < 0) {
+        throw std::runtime_error("エラー: デコーダの起動に失敗しました");
+    }
+
+    pkt_ = av_packet_alloc();
+}
+
+H264Decoder::~H264Decoder() {
+    if (pkt_) av_packet_free(&pkt_);
+    if (codec_ctx_) avcodec_free_context(&codec_ctx_);
+}
+
+bool H264Decoder::decode_packet(const std::vector<uint8_t>& h264_data, AVFrame* out_frame) {
+    if (h264_data.empty()) return false;
+
+    pkt_->data = const_cast<uint8_t*>(h264_data.data());
+    pkt_->size = h264_data.size();
+
+    int ret = avcodec_send_packet(codec_ctx_, pkt_);
+    if (ret < 0) return false;
+
+    if (avcodec_receive_frame(codec_ctx_, out_frame) == 0) {
+        return true;
+    }
+
+    return false;
 }#include "stream/receiver_thread.hpp"
 #include <iostream>
 
@@ -1399,6 +2487,58 @@ void ReceiverThread::thread_loop() {
 #include <stdexcept>
 #include <iostream>
 
+H264Decoder::H264Decoder(DecodeMode mode) {
+    const AVCodec* codec = nullptr;
+    if (mode == DecodeMode::Hardware_Pi4) {
+        codec = avcodec_find_decoder_by_name("h264_v4l2m2m");
+        if (!codec) throw std::runtime_error("エラー: ハードウェアデコーダが見つかりません");
+    } else {
+        codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+        if (!codec) throw std::runtime_error("エラー: ソフトウェアデコーダが見つかりません");
+    }
+
+    codec_ctx_ = avcodec_alloc_context3(codec);
+    if (!codec_ctx_) {
+        throw std::runtime_error("エラー: デコーダの設定データを作れません");
+    }
+
+    if (mode == DecodeMode::Software_CPU) {
+        codec_ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        codec_ctx_->thread_type = FF_THREAD_SLICE;
+        codec_ctx_->thread_count = 4;
+    }
+
+    if (avcodec_open2(codec_ctx_, codec, nullptr) < 0) {
+        throw std::runtime_error("エラー: デコーダの起動に失敗しました");
+    }
+
+    pkt_ = av_packet_alloc();
+}
+
+H264Decoder::~H264Decoder() {
+    if (pkt_) av_packet_free(&pkt_);
+    if (codec_ctx_) avcodec_free_context(&codec_ctx_);
+}
+
+bool H264Decoder::decode_packet(const std::vector<uint8_t>& h264_data, AVFrame* out_frame) {
+    if (h264_data.empty()) return false;
+
+    pkt_->data = const_cast<uint8_t*>(h264_data.data());
+    pkt_->size = h264_data.size();
+
+    int ret = avcodec_send_packet(codec_ctx_, pkt_);
+    if (ret < 0) return false;
+
+    // out_frameに直接データを流し込む（ゼロコピーの準備）
+    if (avcodec_receive_frame(codec_ctx_, out_frame) == 0) {
+        return true;
+    }
+
+    return false;
+}#include "stream/h264_decoder.hpp"
+#include <stdexcept>
+#include <iostream>
+
 H264Decoder::H264Decoder() {
     // 1. H.264の解凍機を探す
     const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
@@ -1468,7 +2608,46 @@ bool H264Decoder::decode_packet(const std::vector<uint8_t>& h264_data, YuvFrame&
     }
 
     return false; // まだ絵が完成していない
-}/**
+}#ifndef RECEIVER_THREAD_HPP_
+#define RECEIVER_THREAD_HPP_
+
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <vector>
+#include <queue> // ★ffplayの滑らかさを生む「キュー」
+
+#include "stream/udp_receiver.hpp"
+#include "stream/h264_decoder.hpp"
+
+class ReceiverThread {
+public:
+    ReceiverThread(int port, DecodeMode mode);
+    ~ReceiverThread();
+
+    ReceiverThread(const ReceiverThread&) = delete;
+    ReceiverThread& operator=(const ReceiverThread&) = delete;
+
+    void start();
+    void stop();
+
+    bool get_latest_frame(AVFrame** out_frame);
+
+private:
+    int port_;
+    DecodeMode mode_;
+    std::thread worker_;
+    std::atomic<bool> stop_flag_{false};
+
+    std::mutex mutex_;
+    
+    // ★ 単一フレームから「順番待ち列（FIFO）」に変更
+    std::queue<AVFrame*> frame_queue_; 
+
+    void thread_loop();
+};
+
+#endif/**
  * @file receiver_thread.hpp
  * @brief パケット受信とH.264解凍を裏方で回し続ける司令塔
  */
@@ -1559,6 +2738,50 @@ private:
     void thread_loop();
 };
 
+#endif/**
+ * @file receiver_thread.hpp
+ * @brief パケット受信とH.264解凍を裏方で回し続ける司令塔
+ */
+#ifndef RECEIVER_THREAD_HPP_
+#define RECEIVER_THREAD_HPP_
+
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <vector>
+
+#include "stream/udp_receiver.hpp"
+#include "stream/h264_decoder.hpp"
+
+class ReceiverThread {
+public:
+    ReceiverThread(int port, DecodeMode mode);
+    ~ReceiverThread();
+
+    ReceiverThread(const ReceiverThread&) = delete;
+    ReceiverThread& operator=(const ReceiverThread&) = delete;
+
+    void start();
+    void stop();
+
+    // 描画側へ AVFrame の参照（ポインタ）を渡す関数
+    bool get_latest_frame(AVFrame** out_frame);
+
+private:
+    int port_;
+    DecodeMode mode_;
+    std::thread worker_;
+    std::atomic<bool> stop_flag_{false};
+
+    std::mutex mutex_;
+    bool has_new_frame_ = false;
+    
+    // std::vector を廃止！ FFmpegのフレームを直接保持する
+    AVFrame* latest_frame_ = nullptr;
+
+    void thread_loop();
+};
+
 #endif#ifndef H264_DECODER_HPP_
 #define H264_DECODER_HPP_
 
@@ -1641,11 +2864,47 @@ private:
      AVPacket* pkt_ = nullptr;             // 圧縮データを運び込むカプセル
  };
  
- #endif#include <iostream>
+ #endif/**
+ * @file h264_decoder.hpp
+ * @brief H.264データを元の生ピクセルに解凍する部品
+ */
+#ifndef H264_DECODER_HPP_
+#define H264_DECODER_HPP_
+
+#include <vector>
+#include <cstdint>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
+
+enum class DecodeMode {
+    Software_CPU,
+    Hardware_Pi4
+};
+
+class H264Decoder {
+public:
+    explicit H264Decoder(DecodeMode mode);
+    ~H264Decoder();
+
+    H264Decoder(const H264Decoder&) = delete;
+    H264Decoder& operator=(const H264Decoder&) = delete;
+
+    // AVFrameに直接解凍結果を書き込むように変更
+    bool decode_packet(const std::vector<uint8_t>& h264_data, AVFrame* out_frame);
+
+private:
+    AVCodecContext* codec_ctx_ = nullptr;
+    AVPacket* pkt_ = nullptr;
+};
+
+#endif#include <iostream>
 #include <csignal>
 #include <atomic>
 #include "stream_app.hpp"
 
+// メインスレッド終了用の安全装置
 std::atomic<bool> keep_running(true);
 void signal_handler(int) {
     keep_running = false;
@@ -1654,16 +2913,19 @@ void signal_handler(int) {
 int main() {
     std::signal(SIGINT, signal_handler);
     std::cout << "--- 映像伝送 Server (受信側) 起動 ---" << std::endl;
-
+    
     try {
-        // ★ここでモードを指定！
+        // =================================================================================
+        // これにより h264_decoder.cpp 内部で、自動的にCPU4コアをフル活用する超低遅延設定
         // DecodeMode::Software_CPU : CPU4コア全開の超低遅延モード
         // DecodeMode::Hardware_Pi4 : GPU専用チップのエコモード
-        DecodeMode mode = DecodeMode::Hardware_Pi4;
+    
+        DecodeMode mode = DecodeMode::Software_CPU;
 
-        // 解像度はClient側に合わせてください（例: 320, 240 または 640, 360など）
-        StreamApp app(1234, "EV Camera Stream", 640, 320, mode);
-
+        // 解像度をClient側（640x360）と同期
+        StreamApp app(1234, "EV Camera Stream", 640, 480, mode);
+        
+        // アプリケーションを実行
         app.run(keep_running);
 
     } catch (const std::exception& e) {
@@ -1679,15 +2941,13 @@ int main() {
 SdlRenderer::SdlRenderer(const std::string& title, int width, int height)
     : width_(width), height_(height) {
     
-    // 1. SDL2（描画システム）を初期化する
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         throw std::runtime_error(std::string("エラー: SDL2の初期化に失敗 -> ") + SDL_GetError());
     }
 
-    // 2. ウィンドウ（画面の枠）を作成する
     window_ = SDL_CreateWindow(
         title.c_str(),
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, // 画面の中央に配置
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         width_, height_,
         SDL_WINDOW_SHOWN
     );
@@ -1695,19 +2955,20 @@ SdlRenderer::SdlRenderer(const std::string& title, int width, int height)
         throw std::runtime_error(std::string("エラー: ウィンドウの作成に失敗 -> ") + SDL_GetError());
     }
 
-    // 3. 描画する筆（GPUアクセラレーションを有効化）を作成する
-    // ※ SDL_RENDERER_ACCELERATED により、ラズパイのGPUを使って超高速に描画します
+    // =======================================================================
+    // ★ 究極の対策B：VSYNCを復元し、天然の整流器として利用する
+    // =======================================================================
+    // モニターのリフレッシュレートに描画を合わせることで、UDPの不規則な到着を
+    // 最適なペースで平滑化し、微細なカクつき（ジッタ）を吸収します。
     renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer_) {
         throw std::runtime_error(std::string("エラー: レンダラーの作成に失敗 -> ") + SDL_GetError());
     }
 
-    // 4. 映像を貼り付けるキャンバス（テクスチャ）を作成する
-    // ★ ここが超重要: H.264から出てきた「YUV420P」という形式を、そのままGPUに流し込める専用キャンバスです
     texture_ = SDL_CreateTexture(
         renderer_,
-        SDL_PIXELFORMAT_IYUV, // YUV形式専用
-        SDL_TEXTUREACCESS_STREAMING, // 毎フレーム映像が書き換わる「動画用」設定
+        SDL_PIXELFORMAT_IYUV,
+        SDL_TEXTUREACCESS_STREAMING,
         width_, height_
     );
     if (!texture_) {
@@ -1716,46 +2977,39 @@ SdlRenderer::SdlRenderer(const std::string& title, int width, int height)
 }
 
 SdlRenderer::~SdlRenderer() {
-    // 綺麗にお掃除
     if (texture_) SDL_DestroyTexture(texture_);
     if (renderer_) SDL_DestroyRenderer(renderer_);
     if (window_) SDL_DestroyWindow(window_);
     SDL_Quit();
 }
 
-void SdlRenderer::render_yuv(const H264Decoder::YuvFrame& frame) {
-    // 1. GPUのキャンバス（テクスチャ）に、解凍された生のYUVデータを直接流し込む！
+void SdlRenderer::render_frame(const AVFrame* frame) {
+    if (!frame) return;
+
     SDL_UpdateYUVTexture(
         texture_,
         nullptr,
-        frame.y_data, frame.y_pitch,
-        frame.u_data, frame.u_pitch,
-        frame.v_data, frame.v_pitch
+        frame->data[0], frame->linesize[0],
+        frame->data[1], frame->linesize[1],
+        frame->data[2], frame->linesize[2]
     );
 
-    // 2. 画面を一度真っ黒にクリアする
     SDL_RenderClear(renderer_);
-
-    // 3. 映像が描き込まれたキャンバスを、ウィンドウ全体に貼り付ける
     SDL_RenderCopy(renderer_, texture_, nullptr, nullptr);
-
-    // 4. 画面に表示！（ここでパッと映像が出ます）
     SDL_RenderPresent(renderer_);
 }
 
 bool SdlRenderer::poll_events() {
     SDL_Event e;
-    // OSから「ウィンドウの×ボタンが押された」「キーボードが押された」などのイベントを読み取る
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) {
-            return false; // 「終了してくれ」という合図
+            return false;
         }
-        // もし「ESCキー」が押されたら終了する（おまけ機能）
         if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {
             return false;
         }
     }
-    return true; // まだ続けてOK
+    return true;
 }#include "stream_app.hpp"
 #include <iostream>
 #include <chrono>
@@ -1766,22 +3020,43 @@ StreamApp::StreamApp(int port, const std::string& title, int width, int height, 
 
 void StreamApp::run(const std::atomic<bool>& keep_running) {
     std::cout << "画面の準備完了。映像の受信を待っています...\n" << std::endl;
-    std::cout << "(終了するには画面の×ボタンか、ターミナルでCtrl+C)\n" << std::endl;
-
+    
     receiver_.start();
+    AVFrame* current_frame = nullptr;
+
+    // ★ ffplay化の心臓部：30fpsのペーシング（1フレームあたり33.3ミリ秒）
+    const auto frame_duration = std::chrono::milliseconds(33); 
+    auto next_render_time = std::chrono::steady_clock::now();
 
     while (keep_running) {
         if (!renderer_.poll_events()) {
             break;
         }
 
-        if (receiver_.get_latest_frame(y_buf_, u_buf_, v_buf_, y_pitch_, u_pitch_, v_pitch_, width_, height_)) {
-            frame_.y_data = y_buf_.data(); frame_.y_pitch = y_pitch_;
-            frame_.u_data = u_buf_.data(); frame_.u_pitch = u_pitch_;
-            frame_.v_data = v_buf_.data(); frame_.v_pitch = v_pitch_;
+        auto now = std::chrono::steady_clock::now();
+        
+        // ★ 次のフレームを描画する時間が来たか？
+        if (now >= next_render_time) {
             
-            renderer_.render_yuv(frame_);
+            if (receiver_.get_latest_frame(&current_frame)) {
+                // 時間通りに描画機へ！
+                renderer_.render_frame(current_frame);
+                av_frame_free(&current_frame);
+                
+                // 次の描画目標時間を33ms後に設定
+                next_render_time += frame_duration;
+                
+                // ネットワークが途切れて時間が大きくズレた場合は、現在時刻にリセット（早送り現象の防止）
+                if (now > next_render_time + frame_duration) {
+                    next_render_time = now;
+                }
+            } else {
+                // キューが空っぽ（パケット到着待ち）なので少し休む
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            
         } else {
+            // まだ描画のタイミングではない（ペースを保つために休む）
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
@@ -1793,13 +3068,10 @@ void StreamApp::run(const std::atomic<bool>& keep_running) {
 
 H264Decoder::H264Decoder(DecodeMode mode) {
     const AVCodec* codec = nullptr;
-
     if (mode == DecodeMode::Hardware_Pi4) {
-        // ハードウェアデコーダを探す
         codec = avcodec_find_decoder_by_name("h264_v4l2m2m");
         if (!codec) throw std::runtime_error("エラー: ハードウェアデコーダが見つかりません");
     } else {
-        // ソフトウェアデコーダを探す
         codec = avcodec_find_decoder(AV_CODEC_ID_H264);
         if (!codec) throw std::runtime_error("エラー: ソフトウェアデコーダが見つかりません");
     }
@@ -1809,9 +3081,16 @@ H264Decoder::H264Decoder(DecodeMode mode) {
         throw std::runtime_error("エラー: デコーダの設定データを作れません");
     }
 
-    // CPUモードの時だけマルチスレッド（低遅延チューニング）を有効にする
     if (mode == DecodeMode::Software_CPU) {
         codec_ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        
+        // =======================================================================
+        // ★ 究極の対策A：パケットロス時のフリーズ（カクつき）を強制回避する
+        // =======================================================================
+        // データが欠損してもフレームを破棄せず、エラーを推測して無理やり出力する
+        codec_ctx_->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;
+        codec_ctx_->error_concealment = FF_EC_GUESS_MVS | FF_EC_DEBLOCK;
+
         codec_ctx_->thread_type = FF_THREAD_SLICE;
         codec_ctx_->thread_count = 4;
     }
@@ -1820,17 +3099,15 @@ H264Decoder::H264Decoder(DecodeMode mode) {
         throw std::runtime_error("エラー: デコーダの起動に失敗しました");
     }
 
-    frame_ = av_frame_alloc();
     pkt_ = av_packet_alloc();
 }
 
 H264Decoder::~H264Decoder() {
-    if (frame_) av_frame_free(&frame_);
     if (pkt_) av_packet_free(&pkt_);
     if (codec_ctx_) avcodec_free_context(&codec_ctx_);
 }
 
-bool H264Decoder::decode_packet(const std::vector<uint8_t>& h264_data, YuvFrame& out_frame) {
+bool H264Decoder::decode_packet(const std::vector<uint8_t>& h264_data, AVFrame* out_frame) {
     if (h264_data.empty()) return false;
 
     pkt_->data = const_cast<uint8_t*>(h264_data.data());
@@ -1839,15 +3116,7 @@ bool H264Decoder::decode_packet(const std::vector<uint8_t>& h264_data, YuvFrame&
     int ret = avcodec_send_packet(codec_ctx_, pkt_);
     if (ret < 0) return false;
 
-    if (avcodec_receive_frame(codec_ctx_, frame_) == 0) {
-        out_frame.y_data = frame_->data[0];
-        out_frame.y_pitch = frame_->linesize[0];
-        out_frame.u_data = frame_->data[1];
-        out_frame.u_pitch = frame_->linesize[1];
-        out_frame.v_data = frame_->data[2];
-        out_frame.v_pitch = frame_->linesize[2];
-        out_frame.width = frame_->width;
-        out_frame.height = frame_->height;
+    if (avcodec_receive_frame(codec_ctx_, out_frame) == 0) {
         return true;
     }
 
@@ -1855,10 +3124,18 @@ bool H264Decoder::decode_packet(const std::vector<uint8_t>& h264_data, YuvFrame&
 }#include "stream/receiver_thread.hpp"
 #include <iostream>
 
-ReceiverThread::ReceiverThread(int port, DecodeMode mode) : port_(port), mode_(mode) {}
+ReceiverThread::ReceiverThread(int port, DecodeMode mode) : port_(port), mode_(mode) {
+}
 
 ReceiverThread::~ReceiverThread() {
     stop();
+    // キューに残ったフレームをすべて綺麗に掃除
+    std::lock_guard<std::mutex> lock(mutex_);
+    while (!frame_queue_.empty()) {
+        AVFrame* f = frame_queue_.front();
+        frame_queue_.pop();
+        av_frame_free(&f);
+    }
 }
 
 void ReceiverThread::start() {
@@ -1869,21 +3146,18 @@ void ReceiverThread::start() {
 void ReceiverThread::stop() {
     stop_flag_.store(true);
     if (worker_.joinable()) {
-        worker_.detach(); 
+        worker_.detach();
     }
 }
 
-bool ReceiverThread::get_latest_frame(std::vector<uint8_t>& y, std::vector<uint8_t>& u, std::vector<uint8_t>& v,
-                                      int& y_pitch, int& u_pitch, int& v_pitch, int& width, int& height) {
+bool ReceiverThread::get_latest_frame(AVFrame** out_frame) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    if (!has_new_frame_) return false;
+    if (frame_queue_.empty()) return false;
 
-    y = y_buf_; u = u_buf_; v = v_buf_;
-    y_pitch = y_pitch_; u_pitch = u_pitch_; v_pitch = v_pitch_;
-    width = width_; height = height_;
+    // ★ キューの先頭（一番古いフレーム）から順番に取り出す
+    *out_frame = frame_queue_.front();
+    frame_queue_.pop();
     
-    has_new_frame_ = false;
     return true;
 }
 
@@ -1891,37 +3165,33 @@ void ReceiverThread::thread_loop() {
     try {
         std::cout << "[裏方スレッド] 受信機と解凍機を準備中..." << std::endl;
         UdpReceiver receiver(port_);
-        // モードを渡して解凍機を生成！
         H264Decoder decoder(mode_);
 
         std::vector<uint8_t> h264_data;
-        H264Decoder::YuvFrame frame;
+        AVFrame* decoded_frame = av_frame_alloc();
 
         std::cout << "[裏方スレッド] >>> パケット受信待機中 (Port: " << port_ << ") <<<" << std::endl;
 
         while (!stop_flag_.load(std::memory_order_relaxed)) {
             if (receiver.receive_packet(h264_data)) {
-                if (decoder.decode_packet(h264_data, frame)) {
+                if (decoder.decode_packet(h264_data, decoded_frame)) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     
-                    size_t y_size = frame.y_pitch * frame.height;
-                    size_t u_size = frame.u_pitch * (frame.height / 2);
-                    size_t v_size = frame.v_pitch * (frame.height / 2);
+                    // ★ 上書きではなく、列の最後尾に追加（クローン）する
+                    frame_queue_.push(av_frame_clone(decoded_frame));
                     
-                    y_buf_.assign(frame.y_data, frame.y_data + y_size);
-                    u_buf_.assign(frame.u_data, frame.u_data + u_size);
-                    v_buf_.assign(frame.v_data, frame.v_data + v_size);
-                    
-                    y_pitch_ = frame.y_pitch;
-                    u_pitch_ = frame.u_pitch;
-                    v_pitch_ = frame.v_pitch;
-                    width_ = frame.width;
-                    height_ = frame.height;
-                    
-                    has_new_frame_ = true;
+                    // ★ 遠隔操作の命「超低遅延」を守るための安全装置
+                    // ネットワークが詰まってバッファが溜まりすぎた場合、一番古いものを捨てて
+                    // 遅延を最大約160ms（5フレーム）以内に強制維持する
+                    if (frame_queue_.size() > 5) {
+                        AVFrame* old = frame_queue_.front();
+                        frame_queue_.pop();
+                        av_frame_free(&old);
+                    }
                 }
             }
         }
+        av_frame_free(&decoded_frame);
     } catch (const std::exception& e) {
         std::cerr << "[裏方スレッド エラー] " << e.what() << std::endl;
     }
@@ -1934,7 +3204,8 @@ UdpReceiver::UdpReceiver(int port) {
     avformat_network_init();
 
     // 待ち受けURL（0.0.0.0 は「どのIPから飛んできても受け止める」という指定）
-    std::string url = "udp://0.0.0.0:" + std::to_string(port);
+    //std::string url = "udp://0.0.0.0:" + std::to_string(port);
+    std::string url = "udp://0.0.0.0:" + std::to_string(port) + "?buffer_size=1024000";
 
     // =======================================================
     // ★ 遠隔操作EV用：バッファリングを殺す「超低遅延マジック」
@@ -2041,51 +3312,47 @@ target_link_libraries(${PROJECT_NAME}
     Threads::Threads
 )/**
  * @file sdl_renderer.hpp
- * @brief 解凍された生ピクセル（YUV）を画面に超低遅延で描画する部品
+ * @brief 解凍された生ピクセルを画面に超低遅延で描画する部品
  */
+#ifndef SDL_RENDERER_HPP_
+#define SDL_RENDERER_HPP_
 
- #ifndef SDL_RENDERER_HPP_
- #define SDL_RENDERER_HPP_
- 
- #include <SDL2/SDL.h>
- #include <string>
- 
- // 解凍機から出てくるデータの形（YuvFrame）を知るために読み込む
- #include "stream/h264_decoder.hpp"
- 
- class SdlRenderer {
- public:
-     // ① 準備：ウィンドウの名前、幅、高さを指定して画面を作る
-     SdlRenderer(const std::string& title, int width, int height);
-     
-     // ② 後片付け：ウィンドウを綺麗に閉じる
-     ~SdlRenderer();
- 
-     // コピー禁止の安全装置
-     SdlRenderer(const SdlRenderer&) = delete;
-     SdlRenderer& operator=(const SdlRenderer&) = delete;
- 
-     // ③ メイン処理：解凍されたYUVデータを受け取って、画面に表示する
-     void render_yuv(const H264Decoder::YuvFrame& frame);
- 
-     // ④ OSの仕事：ウィンドウの「×」ボタンが押されたかなどを監視する
-     bool poll_events();
- 
- private:
-     SDL_Window* window_ = nullptr;     // ウィンドウの枠
-     SDL_Renderer* renderer_ = nullptr; // 描画する筆（GPU）
-     SDL_Texture* texture_ = nullptr;   // 映像を貼り付けるキャンバス
- 
-     int width_;
-     int height_;
- };
- 
- #endif#ifndef STREAM_APP_HPP_
+#include <SDL2/SDL.h>
+#include <string>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
+
+class SdlRenderer {
+public:
+    SdlRenderer(const std::string& title, int width, int height);
+    ~SdlRenderer();
+
+    SdlRenderer(const SdlRenderer&) = delete;
+    SdlRenderer& operator=(const SdlRenderer&) = delete;
+
+    // AVFrame のポインタを直接受け取るように変更
+    void render_frame(const AVFrame* frame);
+    bool poll_events();
+
+private:
+    SDL_Window* window_ = nullptr;
+    SDL_Renderer* renderer_ = nullptr;
+    SDL_Texture* texture_ = nullptr;
+
+    int width_;
+    int height_;
+};
+
+#endif/**
+ * @file stream_app.hpp
+ * @brief 受信と描画を統合して管理するアプリケーションクラス
+ */
+#ifndef STREAM_APP_HPP_
 #define STREAM_APP_HPP_
 
 #include <atomic>
-#include <vector>
-#include <cstdint>
 #include "stream/receiver_thread.hpp"
 #include "display/sdl_renderer.hpp"
 
@@ -2099,11 +3366,6 @@ public:
 private:
     ReceiverThread receiver_;
     SdlRenderer renderer_;
-
-    std::vector<uint8_t> y_buf_, u_buf_, v_buf_;
-    int y_pitch_ = 0, u_pitch_ = 0, v_pitch_ = 0;
-    int width_ = 0, height_ = 0;
-    H264Decoder::YuvFrame frame_;
 };
 
 #endif#ifndef RECEIVER_THREAD_HPP_
@@ -2113,6 +3375,7 @@ private:
 #include <atomic>
 #include <mutex>
 #include <vector>
+#include <queue> // ★ffplayの滑らかさを生む「キュー」
 
 #include "stream/udp_receiver.hpp"
 #include "stream/h264_decoder.hpp"
@@ -2128,8 +3391,7 @@ public:
     void start();
     void stop();
 
-    bool get_latest_frame(std::vector<uint8_t>& y, std::vector<uint8_t>& u, std::vector<uint8_t>& v,
-                          int& y_pitch, int& u_pitch, int& v_pitch, int& width, int& height);
+    bool get_latest_frame(AVFrame** out_frame);
 
 private:
     int port_;
@@ -2138,16 +3400,18 @@ private:
     std::atomic<bool> stop_flag_{false};
 
     std::mutex mutex_;
-    bool has_new_frame_ = false;
     
-    std::vector<uint8_t> y_buf_, u_buf_, v_buf_;
-    int y_pitch_ = 0, u_pitch_ = 0, v_pitch_ = 0;
-    int width_ = 0, height_ = 0;
+    // ★ 単一フレームから「順番待ち列（FIFO）」に変更
+    std::queue<AVFrame*> frame_queue_; 
 
     void thread_loop();
 };
 
-#endif#ifndef H264_DECODER_HPP_
+#endif/**
+ * @file h264_decoder.hpp
+ * @brief H.264データを元の生ピクセルに解凍する部品
+ */
+#ifndef H264_DECODER_HPP_
 #define H264_DECODER_HPP_
 
 #include <vector>
@@ -2157,7 +3421,6 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 }
 
-// デコードモードの選択用スイッチ
 enum class DecodeMode {
     Software_CPU,
     Hardware_Pi4
@@ -2165,25 +3428,17 @@ enum class DecodeMode {
 
 class H264Decoder {
 public:
-    struct YuvFrame {
-        uint8_t* y_data; int y_pitch;
-        uint8_t* u_data; int u_pitch;
-        uint8_t* v_data; int v_pitch;
-        int width;
-        int height;
-    };
-
     explicit H264Decoder(DecodeMode mode);
     ~H264Decoder();
 
     H264Decoder(const H264Decoder&) = delete;
     H264Decoder& operator=(const H264Decoder&) = delete;
 
-    bool decode_packet(const std::vector<uint8_t>& h264_data, YuvFrame& out_frame);
+    // AVFrameに直接解凍結果を書き込むように変更
+    bool decode_packet(const std::vector<uint8_t>& h264_data, AVFrame* out_frame);
 
 private:
     AVCodecContext* codec_ctx_ = nullptr;
-    AVFrame* frame_ = nullptr;
     AVPacket* pkt_ = nullptr;
 };
 

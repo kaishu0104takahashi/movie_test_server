@@ -7,7 +7,8 @@ UdpReceiver::UdpReceiver(int port) {
     avformat_network_init();
 
     // 待ち受けURL（0.0.0.0 は「どのIPから飛んできても受け止める」という指定）
-    std::string url = "udp://0.0.0.0:" + std::to_string(port);
+    //std::string url = "udp://0.0.0.0:" + std::to_string(port);
+    std::string url = "udp://0.0.0.0:" + std::to_string(port) + "?buffer_size=1024000";
 
     // =======================================================
     // ★ 遠隔操作EV用：バッファリングを殺す「超低遅延マジック」

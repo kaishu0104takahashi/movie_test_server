@@ -5,6 +5,7 @@
 #include <atomic>
 #include <mutex>
 #include <vector>
+#include <queue> // ★ffplayの滑らかさを生む「キュー」
 
 #include "stream/udp_receiver.hpp"
 #include "stream/h264_decoder.hpp"
@@ -20,8 +21,7 @@ public:
     void start();
     void stop();
 
-    bool get_latest_frame(std::vector<uint8_t>& y, std::vector<uint8_t>& u, std::vector<uint8_t>& v,
-                          int& y_pitch, int& u_pitch, int& v_pitch, int& width, int& height);
+    bool get_latest_frame(AVFrame** out_frame);
 
 private:
     int port_;
@@ -30,11 +30,9 @@ private:
     std::atomic<bool> stop_flag_{false};
 
     std::mutex mutex_;
-    bool has_new_frame_ = false;
     
-    std::vector<uint8_t> y_buf_, u_buf_, v_buf_;
-    int y_pitch_ = 0, u_pitch_ = 0, v_pitch_ = 0;
-    int width_ = 0, height_ = 0;
+    // ★ 単一フレームから「順番待ち列（FIFO）」に変更
+    std::queue<AVFrame*> frame_queue_; 
 
     void thread_loop();
 };

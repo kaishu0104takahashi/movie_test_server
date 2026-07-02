@@ -22,7 +22,7 @@ int main() {
         DecodeMode mode = DecodeMode::Software_CPU;
 
         // 解像度をClient側（640x360）と同期
-        StreamApp app(1234, "EV Camera Stream", 640, 360, mode);
+        StreamApp app(1234, "EV Camera Stream", 640, 480, mode);
         
         // アプリケーションを実行
         app.run(keep_running);

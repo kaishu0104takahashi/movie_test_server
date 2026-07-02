@@ -1,10 +1,18 @@
 #include "stream/receiver_thread.hpp"
 #include <iostream>
 
-ReceiverThread::ReceiverThread(int port, DecodeMode mode) : port_(port), mode_(mode) {}
+ReceiverThread::ReceiverThread(int port, DecodeMode mode) : port_(port), mode_(mode) {
+}
 
 ReceiverThread::~ReceiverThread() {
     stop();
+    // キューに残ったフレームをすべて綺麗に掃除
+    std::lock_guard<std::mutex> lock(mutex_);
+    while (!frame_queue_.empty()) {
+        AVFrame* f = frame_queue_.front();
+        frame_queue_.pop();
+        av_frame_free(&f);
+    }
 }
 
 void ReceiverThread::start() {
@@ -15,21 +23,18 @@ void ReceiverThread::start() {
 void ReceiverThread::stop() {
     stop_flag_.store(true);
     if (worker_.joinable()) {
-        worker_.detach(); 
+        worker_.detach();
     }
 }
 
-bool ReceiverThread::get_latest_frame(std::vector<uint8_t>& y, std::vector<uint8_t>& u, std::vector<uint8_t>& v,
-                                      int& y_pitch, int& u_pitch, int& v_pitch, int& width, int& height) {
+bool ReceiverThread::get_latest_frame(AVFrame** out_frame) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    if (!has_new_frame_) return false;
+    if (frame_queue_.empty()) return false;
 
-    y = y_buf_; u = u_buf_; v = v_buf_;
-    y_pitch = y_pitch_; u_pitch = u_pitch_; v_pitch = v_pitch_;
-    width = width_; height = height_;
+    // ★ キューの先頭（一番古いフレーム）から順番に取り出す
+    *out_frame = frame_queue_.front();
+    frame_queue_.pop();
     
-    has_new_frame_ = false;
     return true;
 }
 
@@ -37,37 +42,33 @@ void ReceiverThread::thread_loop() {
     try {
         std::cout << "[裏方スレッド] 受信機と解凍機を準備中..." << std::endl;
         UdpReceiver receiver(port_);
-        // モードを渡して解凍機を生成！
         H264Decoder decoder(mode_);
 
         std::vector<uint8_t> h264_data;
-        H264Decoder::YuvFrame frame;
+        AVFrame* decoded_frame = av_frame_alloc();
 
         std::cout << "[裏方スレッド] >>> パケット受信待機中 (Port: " << port_ << ") <<<" << std::endl;
 
         while (!stop_flag_.load(std::memory_order_relaxed)) {
             if (receiver.receive_packet(h264_data)) {
-                if (decoder.decode_packet(h264_data, frame)) {
+                if (decoder.decode_packet(h264_data, decoded_frame)) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     
-                    size_t y_size = frame.y_pitch * frame.height;
-                    size_t u_size = frame.u_pitch * (frame.height / 2);
-                    size_t v_size = frame.v_pitch * (frame.height / 2);
+                    // ★ 上書きではなく、列の最後尾に追加（クローン）する
+                    frame_queue_.push(av_frame_clone(decoded_frame));
                     
-                    y_buf_.assign(frame.y_data, frame.y_data + y_size);
-                    u_buf_.assign(frame.u_data, frame.u_data + u_size);
-                    v_buf_.assign(frame.v_data, frame.v_data + v_size);
-                    
-                    y_pitch_ = frame.y_pitch;
-                    u_pitch_ = frame.u_pitch;
-                    v_pitch_ = frame.v_pitch;
-                    width_ = frame.width;
-                    height_ = frame.height;
-                    
-                    has_new_frame_ = true;
+                    // ★ 遠隔操作の命「超低遅延」を守るための安全装置
+                    // ネットワークが詰まってバッファが溜まりすぎた場合、一番古いものを捨てて
+                    // 遅延を最大約160ms（5フレーム）以内に強制維持する
+                    if (frame_queue_.size() > 5) {
+                        AVFrame* old = frame_queue_.front();
+                        frame_queue_.pop();
+                        av_frame_free(&old);
+                    }
                 }
             }
         }
+        av_frame_free(&decoded_frame);
     } catch (const std::exception& e) {
         std::cerr << "[裏方スレッド エラー] " << e.what() << std::endl;
     }
