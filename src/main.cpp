@@ -19,7 +19,7 @@ int main() {
         // DecodeMode::Software_CPU : CPU4コア全開の超低遅延モード
         // DecodeMode::Hardware_Pi4 : GPU専用チップのエコモード
     
-        DecodeMode mode = DecodeMode::Software_CPU;
+        DecodeMode mode = DecodeMode::Hardware_Pi4;
 
         // 解像度をClient側（640x360）と同期
         StreamApp app(1234, "EV Camera Stream", 640, 480, mode);
