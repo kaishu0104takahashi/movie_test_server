@@ -63,4 +63,13 @@ bool UdpReceiver::receive_packet(AVPacket* pkt) {
     // 読み込みに失敗、またはデータがまだ来ていない場合は false を返すため
     if (ret < 0) return false;
 
-    // 届いたパケットが映像ストリーム以外（
+    // 届いたパケットが映像ストリーム以外（音声やメタデータなど）だった場合の処理
+    if (pkt->stream_index != video_stream_index_) {
+        // 不要なデータなのでメモリを解放して破棄するため
+        av_packet_unref(pkt);
+        return false;
+    }
+    
+    // 正常に映像パケットが取得できた場合は true を返すため
+    return true;
+}
