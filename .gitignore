@@ -1,1 +1,9 @@
 build/
+
+# コンパイル済みの実行ファイルやオブジェクトファイル（保険）
+*.o
+movie_test_server
+
+# エディタやOSの隠しファイル
+.vscode/
+.DS_Store
