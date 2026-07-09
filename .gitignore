@@ -7,3 +7,4 @@ movie_test_server
 # エディタやOSの隠しファイル
 .vscode/
 .DS_Store
+all_source_code_server.txt
