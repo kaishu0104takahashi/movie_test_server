@@ -27,11 +27,12 @@ int main() {
         // （Client側の出力解像度に合わせて 1920x1080 を指定）
         // StreamApp app(1234, "EV Camera Stream", 640, 480, mode); // 低解像度・最適化用
         // StreamApp app(1234, "EV Camera Stream", 1600, 896, mode); // 中解像度用
-        StreamApp app(1234, "EV Camera Stream", 1920, 1080, mode);
+        //StreamApp app(1234, "EV Camera Stream", 1920, 1080, mode);
         //StreamApp app(1234, "EV Camera Stream", 1280, 720, mode);
         //StreamApp app(1234, "EV Camera Stream", 800, 600, mode);
         //StreamApp app(1234, "EV Camera Stream", 640, 480, mode);
-        
+        StreamApp app(1234, "EV Camera Stream", 320, 240, mode);
+
         // 終了フラグを渡し、アプリケーションのメインループを実行するため
         app.run(keep_running);
 
