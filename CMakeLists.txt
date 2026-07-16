@@ -1,41 +1,36 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.10)
+project(movie_test_server)
 
-project(movie_test_server LANGUAGES CXX)
-
-set(CMAKE_CXX_STANDARD 20)
+# C++のバージョン指定
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
-# === パッケージの検索 ===
+# 必要なパッケージ（FFmpeg, SDL2, SDL2_ttf）の検索
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libavutil libswscale)
+pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil)
+
+# SDL2とSDL2_ttfの検索
 find_package(SDL2 REQUIRED)
-find_package(spdlog REQUIRED)
-find_package(fmt REQUIRED)
-find_package(Threads REQUIRED)
+pkg_check_modules(SDL2_TTF REQUIRED SDL2_ttf)
 
-# === ソースファイルの登録 ===
-set(SOURCE_FILES
-    src/main.cpp
-    src/stream_app.cpp
-    src/stream/udp_receiver.cpp
-    src/stream/h264_decoder.cpp
-    src/display/sdl_renderer.cpp
-    src/stream/receiver_thread.cpp
+# インクルードディレクトリの設定
+include_directories(
+    include
+    ${FFMPEG_INCLUDE_DIRS}
+    ${SDL2_INCLUDE_DIRS}
+    ${SDL2_TTF_INCLUDE_DIRS}
 )
 
-# === 実行ファイルの作成 ===
-add_executable(${PROJECT_NAME} ${SOURCE_FILES})
+# srcフォルダ内のすべての .cpp ファイルを再帰的に取得
+file(GLOB_RECURSE SOURCES "src/*.cpp")
 
-target_include_directories(${PROJECT_NAME} PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-)
+# 実行ファイルの生成
+add_executable(movie_test_server ${SOURCES})
 
-target_link_libraries(${PROJECT_NAME}
-    PRIVATE
-    PkgConfig::FFMPEG
-    SDL2::SDL2
-    spdlog::spdlog
-    fmt::fmt
-    Threads::Threads
+# ライブラリのリンク（SDL2_ttf を追加）
+target_link_libraries(movie_test_server
+    ${FFMPEG_LIBRARIES}
+    ${SDL2_LIBRARIES}
+    ${SDL2_TTF_LIBRARIES}
+    pthread
 )
