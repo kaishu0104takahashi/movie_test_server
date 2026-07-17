@@ -9,6 +9,5 @@ movie_test_server
 .DS_Store
 all_source_code_server.txt
 log/
-Doxyfile
 monitor.py
 html/
