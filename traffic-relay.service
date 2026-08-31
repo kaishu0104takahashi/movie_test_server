@@ -1,0 +1,11 @@
+[Unit]
+Description=Traffic Relay for Server Ras5
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/rpi5-server/traffic_relay.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
