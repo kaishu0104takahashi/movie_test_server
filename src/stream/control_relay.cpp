@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <algorithm> // std::max, std::min 用
 
 ControlRelay::ControlRelay(int local_car_port, int local_cam_port, const std::string& target_ip, int target_car_port, int target_cam_port)
     : target_ip_(target_ip), target_car_port_(target_car_port), target_cam_port_(target_cam_port) {
@@ -38,10 +39,11 @@ void ControlRelay::car_relay_loop(int local_port) {
 
     unsigned char buf[8]; 
     
-    // 状態記憶用の変数（whileループの外で保持）
+    // 状態記憶用の変数
     int prev_up = 0;
     int prev_down = 0;
     int target_speed = 0;
+    bool pedal_lockout = false; // クルーズ解除時の急発進防止フラグ
 
     while (keep_running_) {
         ssize_t len = recv(sock, buf, sizeof(buf), 0);
@@ -49,44 +51,68 @@ void ControlRelay::car_relay_loop(int local_port) {
             {
                 std::lock_guard<std::mutex> lock(mtx_);
                 state_.steer = (buf[0] - 126.0f) / 126.0f;
-                state_.throttle = (buf[1] - 126.0f) / 126.0f;
+                // ペダルの初期値(全閉)は 1.0、最大踏み込みは -1.0
+                float raw_throttle = (buf[1] - 126.0f) / 126.0f; 
                 state_.brake = (buf[2] - 126.0f) / 126.0f;
                 state_.horn = buf[3];
                 
-                state_.cruise_set = buf[4];
-                state_.cam_on = buf[5]; 
-
+                int current_cruise = buf[4];
                 int current_up = buf[6];
                 int current_down = buf[7];
 
-                // クルーズがONの時のみ、速度の変動を許可
+                // クルーズがONからOFFに切り替わった瞬間に安全装置を作動
+                if (state_.cruise_set == 1 && current_cruise == 0) {
+                    pedal_lockout = true;
+                    target_speed = 0;
+                }
+                
+                state_.cruise_set = current_cruise;
+                state_.cam_on = buf[5]; 
+
+                float final_throttle = raw_throttle;
+
+                // --- クルーズON: 自動制御 ---
                 if (state_.cruise_set == 1) {
-                    // 前回0(離されている)かつ今回1(押されている)の瞬間だけ反応（エッジ検出）
                     if (current_up == 1 && prev_up == 0) {
                         target_speed += 5;
-                        if (target_speed > 30) {
-                            target_speed = 30; // 上限を30km/hに制限
-                        }
+                        if (target_speed > 30) target_speed = 30; 
                     }
                     if (current_down == 1 && prev_down == 0) {
                         target_speed -= 5;
-                        if (target_speed < 0) {
-                            target_speed = 0; // 0未満にはならないように制限
+                        if (target_speed < 0) target_speed = 0; 
+                    }
+
+                    // 目標速度(0〜30)に合わせて、全閉(1.0)から上限(0.0: 半分)まで段階的に変化させる
+                    final_throttle = 1.0f - (target_speed / 30.0f) * 1.0f;
+                    pedal_lockout = false; // ON中はロック待機不要
+                } 
+                // --- クルーズOFF: 物理ペダル または 安全装置 ---
+                else {
+                    if (pedal_lockout) {
+                        if (raw_throttle >= 0.9f) {
+                            pedal_lockout = false; // ペダルが完全に離された(1.0付近)ら安全装置解除
+                        } else {
+                            final_throttle = 1.0f; // 離されるまでは強制的にアクセル全閉(1.0)を出力
                         }
                     }
                 }
+
+                // --- 安全なバイト変換（計算誤差による暴走防止） ---
+                int throt_val = static_cast<int>(126.0f + final_throttle * 126.0f);
+                buf[1] = static_cast<unsigned char>(std::max(0, std::min(252, throt_val)));
 
                 // 今回のボタン状態を次回用に記憶
                 prev_up = current_up;
                 prev_down = current_down;
 
                 // 画面表示用に構造体へセット
+                state_.throttle = final_throttle;
                 state_.target_speed = target_speed;
             }
             
-            // 車両側(Ras4)の負担を減らすため、ボタンの生データではなく計算済みの目標速度を統合して送る
+            // 目標速度の統合とリセット
             buf[6] = (unsigned char)target_speed;
-            buf[7] = 0; // 統合したためDOWN用バッファは0でリセット
+            buf[7] = 0; 
             
             sendto(sock, buf, len, 0, (struct sockaddr*)&target_addr, sizeof(target_addr));
         }
