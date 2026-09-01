@@ -13,7 +13,6 @@ SdlRenderer::SdlRenderer(const std::string& title, int width, int height)
         throw std::runtime_error(std::string("エラー: SDL2_ttfの初期化に失敗 -> ") + TTF_GetError());
     }
 
-    // ラズパイ標準のフォントを読み込み（サイズ24）
     font_ = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24);
     if (!font_) {
         std::cerr << "Warning: Failed to load font. Overlay will not be shown." << std::endl;
@@ -58,7 +57,6 @@ void SdlRenderer::draw_text(const std::string& text, int x, int y, SDL_Color col
 }
 
 void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
-    // 映像サイズが変わった（または初回）場合のテクスチャ再生成
     if (!texture_ || current_frame_width_ != frame->width || current_frame_height_ != frame->height) {
         if (texture_) SDL_DestroyTexture(texture_);
         current_frame_width_ = frame->width;
@@ -72,7 +70,6 @@ void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
         );
     }
 
-    // YUV映像の更新と描画
     SDL_UpdateYUVTexture(
         texture_, nullptr,
         frame->data[0], frame->linesize[0],
@@ -83,21 +80,28 @@ void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
     SDL_RenderClear(renderer_);
     SDL_RenderCopy(renderer_, texture_, nullptr, nullptr);
 
-    // テキストのオーバーレイ描画
     if (show_overlay_ && font_) {
         SDL_Color green = {0, 255, 0, 255};
         SDL_Color red = {255, 0, 0, 255};
         SDL_Color white = {255, 255, 255, 255};
         
         char buf[128];
+        // 1行目: 基本操作
         snprintf(buf, sizeof(buf), "STR: %.2f | THR: %.2f | BRK: %.2f | HRN: %d", 
                  state.steer, state.throttle, state.brake, state.horn);
         draw_text(buf, 20, 20, green);
         
-        snprintf(buf, sizeof(buf), "CAM: %s", state.cam_on ? "ON" : "OFF");
-        draw_text(buf, 20, 50, state.cam_on ? green : red);
+        // 2行目: クルーズコントロール状態と計算済みの速度表示
+        snprintf(buf, sizeof(buf), "CRUISE: %s | speed:%dkm/h", 
+                 state.cruise_set ? "ON" : "OFF", state.target_speed);
+        draw_text(buf, 20, 50, state.cruise_set ? green : white);
         
-        draw_text("[TAB] Toggle Overlay", 20, 80, white);
+        // 3行目: カメラ状態
+        snprintf(buf, sizeof(buf), "CAM: %s", state.cam_on ? "ON" : "OFF");
+        draw_text(buf, 20, 80, state.cam_on ? green : red);
+        
+        // 4行目: 操作ヘルプ
+        draw_text("[TAB] Toggle Overlay", 20, 110, white);
     }
 
     SDL_RenderPresent(renderer_);
@@ -114,7 +118,7 @@ bool SdlRenderer::poll_events() {
                 return false;
             }
             if (event.key.keysym.sym == SDLK_TAB) {
-                show_overlay_ = !show_overlay_; // TABキーでON/OFF切り替え
+                show_overlay_ = !show_overlay_;
             }
         }
     }

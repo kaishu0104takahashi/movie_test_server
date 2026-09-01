@@ -10,9 +10,16 @@
 // UI描画用に保持する操作データの構造体
 struct ControlState {
     float steer = 0.0f;
-    float throttle = -1.0f;
-    float brake = -1.0f;
+    float throttle = 0.0f;
+    float brake = 0.0f;
     int horn = 0;
+    
+    // 追加が必要な変数
+    int cruise_set = 0;
+    int cruise_off = 0;
+    int cruise_speed_up = 0;
+    int cruise_speed_down = 0;
+    int target_speed = 0; 
     int cam_on = 0;
 };
 
