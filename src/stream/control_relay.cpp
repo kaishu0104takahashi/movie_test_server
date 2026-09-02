@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <algorithm> // std::max, std::min 用
+#include <cmath>     // std::round 用に追加
 
 ControlRelay::ControlRelay(int local_car_port, int local_cam_port, const std::string& target_ip, int target_car_port, int target_cam_port)
     : target_ip_(target_ip), target_car_port_(target_car_port), target_cam_port_(target_cam_port) {
@@ -98,7 +99,7 @@ void ControlRelay::car_relay_loop(int local_port) {
                 }
 
                 // --- 安全なバイト変換（計算誤差による暴走防止） ---
-                int throt_val = static_cast<int>(126.0f + final_throttle * 126.0f);
+                int throt_val = static_cast<int>(std::round(126.0f + final_throttle * 126.0f));
                 buf[1] = static_cast<unsigned char>(std::max(0, std::min(252, throt_val)));
 
                 // 今回のボタン状態を次回用に記憶
