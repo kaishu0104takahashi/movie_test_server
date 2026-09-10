@@ -26,14 +26,25 @@ void StreamApp::run(std::atomic<bool>& keep_running) {
             break;
         }
 
+        // リレーモジュールから最新の操作データを取得
+        ControlState state = relay_->get_current_state();
+        
+        // カメラ状態をReceiverThreadに伝達（OFFならデコード停止）
+        receiver_->set_active(state.cam_on == 1);
+
         AVFrame* frame = nullptr;
-        if (receiver_->get_latest_frame(&frame) && frame != nullptr) {
-            
-            // リレーモジュールから最新の操作データを取得し、描画に渡す
-            ControlState state = relay_->get_current_state();
+        bool got_frame = receiver_->get_latest_frame(&frame);
+
+        if (state.cam_on == 1 && got_frame && frame != nullptr) {
+            // カメラON かつ フレームが存在する場合は映像を描画
             renderer_->render_frame(frame, state);
-            
             av_frame_free(&frame);
+        } else {
+            // カメラOFF、またはフレーム未到達の場合は映像なしで描画を呼ぶ
+            if (frame != nullptr) {
+                av_frame_free(&frame);
+            }
+            renderer_->render_frame(nullptr, state);
         }
         
         // 描画ループの負荷軽減 (約30fps)

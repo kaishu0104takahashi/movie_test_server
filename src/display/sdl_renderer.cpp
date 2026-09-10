@@ -13,6 +13,7 @@ SdlRenderer::SdlRenderer(const std::string& title, int width, int height)
         throw std::runtime_error(std::string("エラー: SDL2_ttfの初期化に失敗 -> ") + TTF_GetError());
     }
 
+    // ラズパイ標準のフォントを読み込み（サイズ24）
     font_ = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24);
     if (!font_) {
         std::cerr << "Warning: Failed to load font. Overlay will not be shown." << std::endl;
@@ -57,50 +58,67 @@ void SdlRenderer::draw_text(const std::string& text, int x, int y, SDL_Color col
 }
 
 void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
-    if (!texture_ || current_frame_width_ != frame->width || current_frame_height_ != frame->height) {
-        if (texture_) SDL_DestroyTexture(texture_);
-        current_frame_width_ = frame->width;
-        current_frame_height_ = frame->height;
-        texture_ = SDL_CreateTexture(
-            renderer_,
-            SDL_PIXELFORMAT_IYUV,
-            SDL_TEXTUREACCESS_STREAMING,
-            current_frame_width_,
-            current_frame_height_
+    // 描画領域をクリア（背景を黒にする）
+    SDL_RenderClear(renderer_);
+
+    // カメラONかつフレームデータが存在する場合のみ映像を描画する
+    if (state.cam_on == 1 && frame != nullptr) {
+        if (!texture_ || current_frame_width_ != frame->width || current_frame_height_ != frame->height) {
+            if (texture_) SDL_DestroyTexture(texture_);
+            current_frame_width_ = frame->width;
+            current_frame_height_ = frame->height;
+            texture_ = SDL_CreateTexture(
+                renderer_,
+                SDL_PIXELFORMAT_IYUV,
+                SDL_TEXTUREACCESS_STREAMING,
+                current_frame_width_,
+                current_frame_height_
+            );
+        }
+
+        SDL_UpdateYUVTexture(
+            texture_, nullptr,
+            frame->data[0], frame->linesize[0],
+            frame->data[1], frame->linesize[1],
+            frame->data[2], frame->linesize[2]
         );
+
+        SDL_RenderCopy(renderer_, texture_, nullptr, nullptr);
+    }
+    // カメラOFFの場合、画面中央に停止メッセージを表示
+    else if (state.cam_on == 0) {
+        if (font_) {
+            SDL_Color yellow = {255, 255, 0, 255};
+            std::string stop_msg = "Camera Stopped / 配信停止中";
+            
+            int text_w = 0, text_h = 0;
+            TTF_SizeUTF8(font_, stop_msg.c_str(), &text_w, &text_h);
+            
+            int win_w, win_h;
+            SDL_GetWindowSize(window_, &win_w, &win_h);
+            
+            draw_text(stop_msg, (win_w - text_w) / 2, (win_h - text_h) / 2, yellow);
+        }
     }
 
-    SDL_UpdateYUVTexture(
-        texture_, nullptr,
-        frame->data[0], frame->linesize[0],
-        frame->data[1], frame->linesize[1],
-        frame->data[2], frame->linesize[2]
-    );
-
-    SDL_RenderClear(renderer_);
-    SDL_RenderCopy(renderer_, texture_, nullptr, nullptr);
-
+    // テキストのオーバーレイ描画
     if (show_overlay_ && font_) {
         SDL_Color green = {0, 255, 0, 255};
         SDL_Color red = {255, 0, 0, 255};
         SDL_Color white = {255, 255, 255, 255};
         
         char buf[128];
-        // 1行目: 基本操作
         snprintf(buf, sizeof(buf), "STR: %.2f | THR: %.2f | BRK: %.2f | HRN: %d", 
                  state.steer, state.throttle, state.brake, state.horn);
         draw_text(buf, 20, 20, green);
         
-        // 2行目: クルーズコントロール状態と計算済みの速度表示
-        snprintf(buf, sizeof(buf), "CRUISE: %s | speed:%dkm/h", 
-                 state.cruise_set ? "ON" : "OFF", state.target_speed);
-        draw_text(buf, 20, 50, state.cruise_set ? green : white);
+        snprintf(buf, sizeof(buf), "CRUISE - SET:%d OFF:%d UP:%d DOWN:%d", 
+                 state.cruise_set, state.cruise_off, state.cruise_speed_up, state.cruise_speed_down);
+        draw_text(buf, 20, 50, green);
         
-        // 3行目: カメラ状態
         snprintf(buf, sizeof(buf), "CAM: %s", state.cam_on ? "ON" : "OFF");
         draw_text(buf, 20, 80, state.cam_on ? green : red);
         
-        // 4行目: 操作ヘルプ
         draw_text("[TAB] Toggle Overlay", 20, 110, white);
     }
 
@@ -118,7 +136,7 @@ bool SdlRenderer::poll_events() {
                 return false;
             }
             if (event.key.keysym.sym == SDLK_TAB) {
-                show_overlay_ = !show_overlay_;
+                show_overlay_ = !show_overlay_; // TABキーでON/OFF切り替え
             }
         }
     }

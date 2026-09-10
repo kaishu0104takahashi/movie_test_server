@@ -15,12 +15,27 @@ ReceiverThread::~ReceiverThread() {
 
 void ReceiverThread::start() {
     stop_flag_.store(false);
+    active_.store(true);
     worker_ = std::thread(&ReceiverThread::thread_loop, this);
 }
 
 void ReceiverThread::stop() {
     stop_flag_.store(true);
     if (worker_.joinable()) worker_.detach();
+}
+
+void ReceiverThread::set_active(bool active) {
+    active_.store(active);
+    
+    // 非アクティブ（OFF）になった瞬間にキューをクリアして古い映像を捨てる
+    if (!active) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        while (!frame_queue_.empty()) {
+            AVFrame* f = frame_queue_.front();
+            frame_queue_.pop();
+            av_frame_free(&f);
+        }
+    }
 }
 
 bool ReceiverThread::get_latest_frame(AVFrame** out_frame) {
@@ -43,22 +58,23 @@ void ReceiverThread::thread_loop() {
         while (!stop_flag_.load(std::memory_order_relaxed)) {
             if (receiver.receive_packet(pkt)) {
                 
-                // 1. まずパケットをデコーダに投げ込む (send)
-                if (decoder.send_packet(pkt)) {
-                    
-                    // 2. ★超重要：デコーダ内に溜まったGPUからの映像を「空になるまで(while)」全て取り出す！
-                    while (decoder.receive_frame(decoded_frame)) {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        frame_queue_.push(av_frame_clone(decoded_frame));
+                // active_ が true の時だけデコード処理を行う
+                if (active_.load(std::memory_order_relaxed)) {
+                    if (decoder.send_packet(pkt)) {
+                        while (decoder.receive_frame(decoded_frame)) {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            frame_queue_.push(av_frame_clone(decoded_frame));
 
-                        // バッファが溜まりすぎたら古いものを捨てる（遠隔操作の命である超低遅延を維持）
-                        if (frame_queue_.size() > 5) {
-                            AVFrame* old = frame_queue_.front();
-                            frame_queue_.pop();
-                            av_frame_free(&old);
+                            // バッファが溜まりすぎたら古いものを捨てる
+                            if (frame_queue_.size() > 5) {
+                                AVFrame* old = frame_queue_.front();
+                                frame_queue_.pop();
+                                av_frame_free(&old);
+                            }
                         }
                     }
                 }
+                // パケットはデコードの有無に関わらず解放し、バッファ詰まりを防ぐ
                 av_packet_unref(pkt);
             }
         }

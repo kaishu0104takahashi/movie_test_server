@@ -5,7 +5,7 @@
 #include <atomic>
 #include <mutex>
 #include <vector>
-#include <queue> // ★ffplayの滑らかさを生む「キュー」
+#include <queue> 
 
 #include "stream/udp_receiver.hpp"
 #include "stream/h264_decoder.hpp"
@@ -23,15 +23,17 @@ public:
 
     bool get_latest_frame(AVFrame** out_frame);
 
+    // 追加: 映像のデコード処理を一時停止/再開する設定関数
+    void set_active(bool active);
+
 private:
     int port_;
     DecodeMode mode_;
     std::thread worker_;
     std::atomic<bool> stop_flag_{false};
+    std::atomic<bool> active_{true}; // 追加: デコードの実行状態フラグ
 
     std::mutex mutex_;
-    
-    // ★ 単一フレームから「順番待ち列（FIFO）」に変更
     std::queue<AVFrame*> frame_queue_; 
 
     void thread_loop();
