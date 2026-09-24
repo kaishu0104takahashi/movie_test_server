@@ -15,10 +15,7 @@ public:
     SdlRenderer(const std::string& title, int width, int height);
     ~SdlRenderer();
 
-    // 描画処理（フレームデータと操作データの両方を受け取る）
     void render_frame(AVFrame* frame, const ControlState& state);
-    
-    // イベント監視（ESCや×ボタンでの終了判定、TABでの表示切替）
     bool poll_events();
 
 private:
@@ -29,11 +26,12 @@ private:
     SDL_Texture* texture_;
 
     TTF_Font* font_ = nullptr;
-    bool show_overlay_ = true; // テキストオーバーレイの表示フラグ
+    bool show_overlay_ = true;
     int current_frame_width_ = 0;
     int current_frame_height_ = 0;
 
     void draw_text(const std::string& text, int x, int y, SDL_Color color);
+    void fill_circle(int cx, int cy, int radius, SDL_Color color); // ★追加: 円の描画
 };
 
 #endif

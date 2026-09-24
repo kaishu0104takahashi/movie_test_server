@@ -1,6 +1,7 @@
 #include "display/sdl_renderer.hpp"
 #include <stdexcept>
 #include <iostream>
+#include <cmath> // ★追加: 円の描画計算用
 
 SdlRenderer::SdlRenderer(const std::string& title, int width, int height)
     : width_(width), height_(height), texture_(nullptr) {
@@ -13,7 +14,6 @@ SdlRenderer::SdlRenderer(const std::string& title, int width, int height)
         throw std::runtime_error(std::string("エラー: SDL2_ttfの初期化に失敗 -> ") + TTF_GetError());
     }
 
-    // ラズパイ標準のフォントを読み込み（サイズ24）
     font_ = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24);
     if (!font_) {
         std::cerr << "Warning: Failed to load font. Overlay will not be shown." << std::endl;
@@ -57,11 +57,20 @@ void SdlRenderer::draw_text(const std::string& text, int x, int y, SDL_Color col
     SDL_FreeSurface(surface);
 }
 
+// ★追加: 塗りつぶしの円を描画する関数
+void SdlRenderer::fill_circle(int cx, int cy, int radius, SDL_Color color) {
+    SDL_SetRenderDrawColor(renderer_, color.r, color.g, color.b, color.a);
+    for (int dy = -radius; dy <= radius; dy++) {
+        int dx = static_cast<int>(std::sqrt(radius * radius - dy * dy));
+        SDL_RenderDrawLine(renderer_, cx - dx, cy + dy, cx + dx, cy + dy);
+    }
+}
+
 void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
     // 描画領域をクリア（背景を黒にする）
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
     SDL_RenderClear(renderer_);
 
-    // カメラONかつフレームデータが存在する場合のみ映像を描画する
     if (state.cam_on == 1 && frame != nullptr) {
         if (!texture_ || current_frame_width_ != frame->width || current_frame_height_ != frame->height) {
             if (texture_) SDL_DestroyTexture(texture_);
@@ -85,11 +94,11 @@ void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
 
         SDL_RenderCopy(renderer_, texture_, nullptr, nullptr);
     }
-    // カメラOFFの場合、画面中央に停止メッセージを表示
     else if (state.cam_on == 0) {
         if (font_) {
             SDL_Color yellow = {255, 255, 0, 255};
-            std::string stop_msg = "Camera Stopped / 配信停止中";
+            // ★修正: 日本語が使えない環境を考慮し、英語のみのメッセージに変更
+            std::string stop_msg = "Camera Stopped";
             
             int text_w = 0, text_h = 0;
             TTF_SizeUTF8(font_, stop_msg.c_str(), &text_w, &text_h);
@@ -101,7 +110,6 @@ void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
         }
     }
 
-    // テキストのオーバーレイ描画
     if (show_overlay_ && font_) {
         SDL_Color green = {0, 255, 0, 255};
         SDL_Color red = {255, 0, 0, 255};
@@ -122,6 +130,16 @@ void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
         draw_text("[TAB] Toggle Overlay", 20, 110, white);
     }
 
+    // ★追加: 障害物検知アラート（赤丸）の描画
+    if (state.distance_alert == 1) {
+        int win_w, win_h;
+        SDL_GetWindowSize(window_, &win_w, &win_h);
+        
+        // 画面の右上に半径30の赤丸を描画 (端から50pxのマージン)
+        SDL_Color red = {255, 0, 0, 255};
+        fill_circle(win_w - 50, 50, 30, red);
+    }
+
     SDL_RenderPresent(renderer_);
 }
 
@@ -136,7 +154,7 @@ bool SdlRenderer::poll_events() {
                 return false;
             }
             if (event.key.keysym.sym == SDLK_TAB) {
-                show_overlay_ = !show_overlay_; // TABキーでON/OFF切り替え
+                show_overlay_ = !show_overlay_; 
             }
         }
     }
