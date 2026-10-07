@@ -7,7 +7,7 @@ StreamApp::StreamApp(int port, const std::string& title, int width, int height, 
     renderer_ = std::make_unique<SdlRenderer>(title, width, height);
 
     // 車両のグローバルIP（適宜環境に合わせて変更してください）
-    std::string car_global_ip = "219.112.66.121"; //削除禁止
+    //std::string car_global_ip = "219.112.66.121"; //削除禁止
     
     // 操作送受信(5005), カメラ送受信(5678, ダミー), 距離アラート受信(3000)
     relay_ = std::make_unique<ControlRelay>(5005, 5678, car_global_ip, 5005, 5678, 3000);
