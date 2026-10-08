@@ -1,7 +1,7 @@
 #include "display/sdl_renderer.hpp"
 #include <stdexcept>
 #include <iostream>
-#include <cmath> // ★追加: 円の描画計算用
+#include <cmath> // 円の描画計算用
 
 SdlRenderer::SdlRenderer(const std::string& title, int width, int height)
     : width_(width), height_(height), texture_(nullptr) {
@@ -57,7 +57,6 @@ void SdlRenderer::draw_text(const std::string& text, int x, int y, SDL_Color col
     SDL_FreeSurface(surface);
 }
 
-// ★追加: 塗りつぶしの円を描画する関数
 void SdlRenderer::fill_circle(int cx, int cy, int radius, SDL_Color color) {
     SDL_SetRenderDrawColor(renderer_, color.r, color.g, color.b, color.a);
     for (int dy = -radius; dy <= radius; dy++) {
@@ -126,22 +125,17 @@ void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
         snprintf(buf, sizeof(buf), "CAM: %s", state.cam_on ? "ON" : "OFF");
         draw_text(buf, 20, 80, state.cam_on ? green : red);
         
-        draw_text("[TAB] Toggle Overlay", 20, 110, white);
+        draw_text("[TAB] Toggle Overlay | [ESC] Toggle Fullscreen | [Q] Quit", 20, 110, white);
 
-        // ==============================================================
-        // ★修正ポイント: ここに接続状態(connected)の描画処理を確実に追加しました
-        // ==============================================================
         int win_w, win_h;
         SDL_GetWindowSize(window_, &win_w, &win_h);
 
-        // 1. コックピットの接続状態
         char cockpit_buf[64];
         snprintf(cockpit_buf, sizeof(cockpit_buf), "cockpit:%s", state.cockpit_connected ? "connected" : "disconnected");
         int cw = 0, ch = 0;
         TTF_SizeUTF8(font_, cockpit_buf, &cw, &ch);
         draw_text(cockpit_buf, win_w - cw - 20, 20, state.cockpit_connected ? green : red);
 
-        // 2. rpi5-clientの接続状態
         char client_buf[64];
         snprintf(client_buf, sizeof(client_buf), "rpi5-client:%s", state.client_connected ? "connected" : "disconnected");
         int rw = 0, rh = 0;
@@ -149,12 +143,10 @@ void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
         draw_text(client_buf, win_w - rw - 20, 20 + ch + 10, state.client_connected ? green : red);
     }
 
-    // ★追加: 障害物検知アラート（赤丸）の描画
     if (state.distance_alert == 1) {
         int win_w, win_h;
         SDL_GetWindowSize(window_, &win_w, &win_h);
         
-        // 画面の右上に半径30の赤丸を描画 (テキストと被らないようにY座標を調整)
         SDL_Color red = {255, 0, 0, 255};
         fill_circle(win_w - 50, 120, 30, red);
     }
@@ -169,7 +161,13 @@ bool SdlRenderer::poll_events() {
             return false;
         }
         if (event.type == SDL_KEYDOWN) {
+            // ★変更: ESCキーでフルスクリーン切替
             if (event.key.keysym.sym == SDLK_ESCAPE) {
+                Uint32 is_fullscreen = SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN_DESKTOP;
+                SDL_SetWindowFullscreen(window_, is_fullscreen ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+            }
+            // ★追加: Qキーでアプリ終了
+            if (event.key.keysym.sym == SDLK_q) {
                 return false;
             }
             if (event.key.keysym.sym == SDLK_TAB) {
