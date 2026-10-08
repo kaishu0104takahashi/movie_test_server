@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <netinet/in.h>
+#include <chrono> // ★追加：時間計測用
 
 // UI描画用に保持する操作データの構造体
 struct ControlState {
@@ -22,6 +23,10 @@ struct ControlState {
     int cam_on = 0;
 
     int distance_alert = 0; // ★追加：障害物検知フラグ
+
+    // ★追加：接続状態フラグ
+    bool cockpit_connected = false;
+    bool client_connected = false; 
 };
 
 class ControlRelay {
@@ -41,10 +46,14 @@ private:
 
     std::atomic<bool> keep_running_{true};
     std::thread car_thread_;
-    std::thread dist_thread_; // ★追加：距離フラグ受信スレッド
+    std::thread dist_thread_; // ★追加：距離フラグ（兼 生存確認）受信スレッド
     
     ControlState state_;
     std::mutex mtx_;
+
+    // ★追加：最終受信時刻を記録する変数
+    std::chrono::steady_clock::time_point last_cockpit_recv_time_;
+    std::chrono::steady_clock::time_point last_client_recv_time_;
 
     void car_relay_loop(int local_port);
     void dist_receive_loop(int local_port); // ★追加

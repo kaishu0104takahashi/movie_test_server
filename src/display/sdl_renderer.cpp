@@ -97,7 +97,6 @@ void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
     else if (state.cam_on == 0) {
         if (font_) {
             SDL_Color yellow = {255, 255, 0, 255};
-            // ★修正: 日本語が使えない環境を考慮し、英語のみのメッセージに変更
             std::string stop_msg = "Camera Stopped";
             
             int text_w = 0, text_h = 0;
@@ -128,6 +127,26 @@ void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
         draw_text(buf, 20, 80, state.cam_on ? green : red);
         
         draw_text("[TAB] Toggle Overlay", 20, 110, white);
+
+        // ==============================================================
+        // ★修正ポイント: ここに接続状態(connected)の描画処理を確実に追加しました
+        // ==============================================================
+        int win_w, win_h;
+        SDL_GetWindowSize(window_, &win_w, &win_h);
+
+        // 1. コックピットの接続状態
+        char cockpit_buf[64];
+        snprintf(cockpit_buf, sizeof(cockpit_buf), "cockpit:%s", state.cockpit_connected ? "connected" : "disconnected");
+        int cw = 0, ch = 0;
+        TTF_SizeUTF8(font_, cockpit_buf, &cw, &ch);
+        draw_text(cockpit_buf, win_w - cw - 20, 20, state.cockpit_connected ? green : red);
+
+        // 2. rpi5-clientの接続状態
+        char client_buf[64];
+        snprintf(client_buf, sizeof(client_buf), "rpi5-client:%s", state.client_connected ? "connected" : "disconnected");
+        int rw = 0, rh = 0;
+        TTF_SizeUTF8(font_, client_buf, &rw, &rh);
+        draw_text(client_buf, win_w - rw - 20, 20 + ch + 10, state.client_connected ? green : red);
     }
 
     // ★追加: 障害物検知アラート（赤丸）の描画
@@ -135,9 +154,9 @@ void SdlRenderer::render_frame(AVFrame* frame, const ControlState& state) {
         int win_w, win_h;
         SDL_GetWindowSize(window_, &win_w, &win_h);
         
-        // 画面の右上に半径30の赤丸を描画 (端から50pxのマージン)
+        // 画面の右上に半径30の赤丸を描画 (テキストと被らないようにY座標を調整)
         SDL_Color red = {255, 0, 0, 255};
-        fill_circle(win_w - 50, 50, 30, red);
+        fill_circle(win_w - 50, 120, 30, red);
     }
 
     SDL_RenderPresent(renderer_);

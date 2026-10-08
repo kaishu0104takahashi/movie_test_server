@@ -7,18 +7,30 @@
 ControlRelay::ControlRelay(int local_car_port, int local_cam_port, const std::string& target_ip, int target_car_port, int target_cam_port, int local_dist_port)
     : target_ip_(target_ip), target_car_port_(target_car_port), target_cam_port_(target_cam_port), local_dist_port_(local_dist_port) {
     
+    // ★追加: 起動時の時間を初期値としてセット
+    last_cockpit_recv_time_ = std::chrono::steady_clock::now();
+    last_client_recv_time_ = std::chrono::steady_clock::now();
+
     car_thread_ = std::thread(&ControlRelay::car_relay_loop, this, local_car_port);
-    dist_thread_ = std::thread(&ControlRelay::dist_receive_loop, this, local_dist_port); // ★追加
+    
+    // ★追加: 3000番ポートでの受信スレッドを起動
+    dist_thread_ = std::thread(&ControlRelay::dist_receive_loop, this, local_dist_port);
 }
 
 ControlRelay::~ControlRelay() {
     keep_running_ = false;
     if (car_thread_.joinable()) car_thread_.join();
-    if (dist_thread_.joinable()) dist_thread_.join();
+    if (dist_thread_.joinable()) dist_thread_.join(); // ★追加
 }
 
 ControlState ControlRelay::get_current_state() {
     std::lock_guard<std::mutex> lock(mtx_);
+    
+    // ★追加: 最終受信時刻から1秒(1000ms)以内なら接続中(true)と判定
+    auto now = std::chrono::steady_clock::now();
+    state_.cockpit_connected = (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_cockpit_recv_time_).count() < 1000);
+    state_.client_connected = (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_client_recv_time_).count() < 1000);
+
     return state_;
 }
 
@@ -49,6 +61,9 @@ void ControlRelay::car_relay_loop(int local_port) {
         if (len == 8) {
             {
                 std::lock_guard<std::mutex> lock(mtx_);
+                // ★追加: コックピットからデータを受信したら現在時刻に更新
+                last_cockpit_recv_time_ = std::chrono::steady_clock::now();
+
                 state_.steer = (buf[0] - 126.0f) / 126.0f;
                 state_.throttle = (buf[1] - 126.0f) / 126.0f;
                 state_.brake = (buf[2] - 126.0f) / 126.0f;
@@ -87,7 +102,7 @@ void ControlRelay::car_relay_loop(int local_port) {
     close(sock);
 }
 
-// ★追加: 距離センサのフラグを受信するループ
+// ★追加: クライアントからの3000番ポートを受信するループ
 void ControlRelay::dist_receive_loop(int local_port) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     sockaddr_in local_addr{};
@@ -105,6 +120,8 @@ void ControlRelay::dist_receive_loop(int local_port) {
         ssize_t len = recv(sock, buf, sizeof(buf), 0);
         if (len == 1) {
             std::lock_guard<std::mutex> lock(mtx_);
+            // ★追加: クライアント(rpi5-client)からデータを受信したら現在時刻に更新（生存確認）
+            last_client_recv_time_ = std::chrono::steady_clock::now();
             state_.distance_alert = buf[0];
         }
     }
