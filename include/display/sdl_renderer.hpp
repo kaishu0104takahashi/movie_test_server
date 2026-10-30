@@ -31,7 +31,9 @@ private:
     int current_frame_height_ = 0;
 
     void draw_text(const std::string& text, int x, int y, SDL_Color color);
-    void fill_circle(int cx, int cy, int radius, SDL_Color color); // ★追加: 円の描画
+    void fill_circle(int cx, int cy, int radius, SDL_Color color);
+    void fill_rect(int x, int y, int w, int h, SDL_Color color); // 追加: 塗りつぶしの四角形
+    void draw_rect(int x, int y, int w, int h, SDL_Color color); // 追加: 枠線のみの四角形
 };
 
 #endif
